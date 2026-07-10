@@ -59,11 +59,11 @@ clean:
 
 # ---- SBOM generation ----
 CC            ?= cc
-WOLFSSL_DIR   ?= ../../wolfssl
-VERSION       := $(shell sed -n 's/^# wolfHSM Release v\([0-9][0-9.]*\).*/\1/p' ChangeLog.md | head -1)
-SRCS          := $(wildcard src/*.c)
-SBOM_CDX      := wolfhsm-$(VERSION).cdx.json
-SBOM_SPDX     := wolfhsm-$(VERSION).spdx.json
+WOLFSSL_DIR   ?= ../wolfssl
+VERSION        = $(shell sed -n 's/^# wolfHSM Release v\([0-9][0-9.]*\).*/\1/p' ChangeLog.md | head -1)
+SRCS          := $(sort $(wildcard src/*.c))
+SBOM_CDX       = wolfhsm-$(VERSION).cdx.json
+SBOM_SPDX      = wolfhsm-$(VERSION).spdx.json
 
 .PHONY: sbom
 
@@ -79,19 +79,22 @@ sbom:
 	fi
 	@if [ ! -f "$(WOLFSSL_DIR)/scripts/gen-sbom" ]; then \
 	    echo "ERROR: $(WOLFSSL_DIR)/scripts/gen-sbom not found." >&2; \
-	    echo "       Use a wolfSSL tree that includes SBOM support." >&2; \
+	    echo "       The sbom target needs a wolfSSL source tree that includes" >&2; \
+	    echo "       scripts/gen-sbom (wolfSSL PR #10343, pending a future release)." >&2; \
+	    echo "       Set WOLFSSL_DIR to such a tree." >&2; \
 	    exit 1; \
 	fi
 	@echo "wolfHSM version: $(VERSION)"
 	@echo "Sources:         $(words $(SRCS)) .c files in src/"
-	@_defines=$$(mktemp /tmp/wolfhsm-defines.XXXXXX) && \
-	trap 'rm -f "$$_defines"' EXIT && \
+	@_defines=$$(mktemp "$${TMPDIR:-/tmp}/wolfhsm-defines.XXXXXX") && \
+	trap 'rm -f "$$_defines"' 0 && \
 	if ! $(CC) -dM -E -I. -I$(WOLFSSL_DIR) -x c /dev/null >"$$_defines" 2>/dev/null; then \
 	    echo "ERROR: $(CC) -dM -E failed." >&2; exit 1; \
 	fi && \
-	_py=$$(command -v python3 2>/dev/null || command -v python 2>/dev/null) && \
-	[ -n "$$_py" ] || { echo "ERROR: python3 not found." >&2; exit 1; } && \
-	"$$_py" $(WOLFSSL_DIR)/scripts/gen-sbom \
+	if ! command -v python3 >/dev/null 2>&1; then \
+	    echo "ERROR: python3 not found." >&2; exit 1; \
+	fi && \
+	python3 $(WOLFSSL_DIR)/scripts/gen-sbom \
 	    --name wolfhsm \
 	    --version $(VERSION) \
 	    --supplier "wolfSSL Inc." \

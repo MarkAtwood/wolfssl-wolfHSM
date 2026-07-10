@@ -31,22 +31,34 @@ please refer to the following resources.
 wolfHSM generates a Software Bill of Materials (SBOM) in CycloneDX 1.6 and
 SPDX 2.3 formats to support compliance with the EU Cyber Resilience Act (CRA).
 
-wolfHSM uses a custom build system; invoke `gen-sbom` from the wolfssl source
-tree directly:
+Generate both SBOMs with the `sbom` Makefile target:
+
+```sh
+make sbom WOLFSSL_DIR=../wolfssl
+```
+
+This parses the version from `ChangeLog.md`, collects `src/*.c`, and writes
+`wolfhsm-<version>.cdx.json` and `wolfhsm-<version>.spdx.json`.
+
+`WOLFSSL_DIR` must point to a wolfssl source tree containing `scripts/gen-sbom`,
+which ships in wolfSSL PR #10343 (pending a future wolfSSL release). If the
+script is absent the target fails with a message telling you what is missing.
+
+Requires `python3` and `pyspdxtools` (`pip install spdx-tools`).
+
+To invoke `gen-sbom` directly instead of through the target, run the same
+command it runs:
 
 ```sh
 python3 $WOLFSSL_DIR/scripts/gen-sbom \
     --name wolfhsm \
-    --version $(head -1 $WOLFHSM_DIR/ChangeLog.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') \
+    --version $(sed -n 's/^# wolfHSM Release v\([0-9][0-9.]*\).*/\1/p' ChangeLog.md | head -1) \
     --supplier "wolfSSL Inc." \
+    --license-file LICENSING \
     --options-h $WOLFSSL_DIR/include/wolfssl/options.h \
-    --srcs $WOLFHSM_DIR/src/*.c
+    --srcs src/*.c \
+    --cdx-out wolfhsm.cdx.json \
+    --spdx-out wolfhsm.spdx.json
 ```
-
-`WOLFSSL_DIR` must point to a wolfssl source tree containing `scripts/gen-sbom`
-(branch `feat/sbom-embedded`, or `master` once wolfSSL/wolfssl#10343 merges).
-`WOLFHSM_DIR` is the root of the wolfHSM source tree.
-
-Requires `python3` and `pyspdxtools` (`pip install spdx-tools`).
 
 For further CRA guidance see [wolfssl/doc/CRA.md](https://github.com/wolfSSL/wolfssl/blob/master/doc/CRA.md).
