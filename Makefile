@@ -60,7 +60,7 @@ clean:
 # ---- SBOM generation ----
 CC            ?= cc
 WOLFSSL_DIR   ?= ../wolfssl
-VERSION        = $(shell sed -n 's/^# wolfHSM Release v\([0-9][0-9.]*\).*/\1/p' ChangeLog.md | head -1)
+VERSION        = $(shell sed -n 's/^. wolfHSM Release v//p' ChangeLog.md | head -1 | cut -d' ' -f1)
 SRCS          := $(sort $(wildcard src/*.c))
 SBOM_CDX       = wolfhsm-$(VERSION).cdx.json
 SBOM_SPDX      = wolfhsm-$(VERSION).spdx.json
