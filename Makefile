@@ -60,6 +60,7 @@ clean:
 # ---- SBOM generation ----
 CC            ?= cc
 WOLFSSL_DIR   ?= ../wolfssl
+WOLFHSM_CFG_DIR ?= test/config
 VERSION        = $(shell sed -n 's/^. wolfHSM Release v//p' ChangeLog.md | head -1 | cut -d' ' -f1)
 SRCS          := $(sort $(wildcard src/*.c))
 SBOM_CDX       = wolfhsm-$(VERSION).cdx.json
@@ -84,12 +85,41 @@ sbom:
 	    echo "       Set WOLFSSL_DIR to such a tree." >&2; \
 	    exit 1; \
 	fi
+	@if [ ! -f "$(WOLFHSM_CFG_DIR)/wolfhsm_cfg.h" ]; then \
+	    echo "ERROR: $(WOLFHSM_CFG_DIR)/wolfhsm_cfg.h not found." >&2; \
+	    echo "       Set WOLFHSM_CFG_DIR to the directory holding the" >&2; \
+	    echo "       wolfhsm_cfg.h (and user_settings.h) your build uses." >&2; \
+	    exit 1; \
+	fi
 	@echo "wolfHSM version: $(VERSION)"
 	@echo "Sources:         $(words $(SRCS)) .c files in src/"
+	@echo "Config:          $(WOLFHSM_CFG_DIR)/wolfhsm_cfg.h"
+# Effective build config for the SBOM: preprocess wolfhsm/wh_settings.h with
+# the same defines and include path the test build compiles under, so the -dM
+# dump holds every WOLFHSM_CFG_* option (explicit and defaulted) plus the
+# wolfSSL options from user_settings.h — the configuration the library is
+# actually built with. Point WOLFHSM_CFG_DIR at the directory holding your
+# build's wolfhsm_cfg.h/user_settings.h for an integrator-accurate SBOM.
+#
+# ponytail: wh_settings.h pulls libc headers (stdint/stdio/strings/stdatomic),
+# so ~330 toolchain constants (INT16_MAX, ACCESSPERMS, ...) ride along into
+# the SBOM next to the ~175 real config macros. The dump is deliberately NOT
+# filtered here: a prefix allowlist would silently drop real options that
+# carry no standard prefix (GCM_TABLE_4BIT, FP_MAX_BITS, SINGLE_THREADED).
+# The durable fix belongs in gen-sbom's noise filter (wolfSSL PR #10343,
+# scripts/gen-sbom _NOISE_MACRO_RE), either of:
+#   a) provenance filtering: accept a -dD dump and use its #line markers to
+#      drop macros defined in system headers, or
+#   b) an --options-baseline flag: subtract a second -dM dump made with the
+#      same flags minus the -include, plus the libc headers it pulls.
+# Once gen-sbom grows that, this recipe needs no change — it already hands
+# over the full dump.
 	@_defines=$$(mktemp "$${TMPDIR:-/tmp}/wolfhsm-defines.XXXXXX") && \
 	trap 'rm -f "$$_defines"' 0 && \
-	if ! $(CC) -dM -E -I. -I$(WOLFSSL_DIR) -x c /dev/null >"$$_defines" 2>/dev/null; then \
-	    echo "ERROR: $(CC) -dM -E failed." >&2; exit 1; \
+	if ! $(CC) -dM -E -DWOLFHSM_CFG -DWOLFSSL_USER_SETTINGS \
+	    -I. -I$(WOLFHSM_CFG_DIR) -I$(WOLFSSL_DIR) \
+	    -include wolfhsm/wh_settings.h -x c /dev/null >"$$_defines"; then \
+	    echo "ERROR: $(CC) -dM -E on wolfhsm/wh_settings.h failed." >&2; exit 1; \
 	fi && \
 	if ! command -v python3 >/dev/null 2>&1; then \
 	    echo "ERROR: python3 not found." >&2; exit 1; \
