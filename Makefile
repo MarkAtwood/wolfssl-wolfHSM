@@ -57,80 +57,69 @@ clean:
 	make -C tools clean
 	make -C examples clean
 
-# ---- SBOM generation ----
-CC            ?= cc
-WOLFSSL_DIR   ?= ../wolfssl
-WOLFHSM_CFG_DIR ?= test/config
-VERSION        = $(shell sed -n 's/^. wolfHSM Release v//p' ChangeLog.md | head -1 | cut -d' ' -f1)
-SRCS          := $(sort $(wildcard src/*.c))
-SBOM_CDX       = wolfhsm-$(VERSION).cdx.json
-SBOM_SPDX      = wolfhsm-$(VERSION).spdx.json
-
-.PHONY: sbom
-
-sbom:
-	@if [ -z "$(VERSION)" ]; then \
-	    echo "ERROR: could not parse version from ChangeLog.md." >&2; \
-	    exit 1; \
-	fi
-	@if [ -z "$(WOLFSSL_DIR)" ] || [ ! -d "$(WOLFSSL_DIR)" ]; then \
-	    echo "ERROR: WOLFSSL_DIR=$(WOLFSSL_DIR) is not a directory." >&2; \
-	    echo "       Set WOLFSSL_DIR to your wolfssl source tree." >&2; \
-	    exit 1; \
-	fi
-	@if [ ! -f "$(WOLFSSL_DIR)/scripts/gen-sbom" ]; then \
-	    echo "ERROR: $(WOLFSSL_DIR)/scripts/gen-sbom not found." >&2; \
-	    echo "       The sbom target needs a wolfSSL source tree that includes" >&2; \
-	    echo "       scripts/gen-sbom (wolfSSL PR #10343, pending a future release)." >&2; \
-	    echo "       Set WOLFSSL_DIR to such a tree." >&2; \
-	    exit 1; \
-	fi
-	@if [ ! -f "$(WOLFHSM_CFG_DIR)/wolfhsm_cfg.h" ]; then \
-	    echo "ERROR: $(WOLFHSM_CFG_DIR)/wolfhsm_cfg.h not found." >&2; \
-	    echo "       Set WOLFHSM_CFG_DIR to the directory holding the" >&2; \
-	    echo "       wolfhsm_cfg.h (and user_settings.h) your build uses." >&2; \
-	    exit 1; \
-	fi
-	@echo "wolfHSM version: $(VERSION)"
-	@echo "Sources:         $(words $(SRCS)) .c files in src/"
-	@echo "Config:          $(WOLFHSM_CFG_DIR)/wolfhsm_cfg.h"
-# Effective build config for the SBOM: preprocess wolfhsm/wh_settings.h with
-# the same defines and include path the test build compiles under, so the -dM
-# dump holds every WOLFHSM_CFG_* option (explicit and defaulted) plus the
-# wolfSSL options from user_settings.h — the configuration the library is
-# actually built with. Point WOLFHSM_CFG_DIR at the directory holding your
-# build's wolfhsm_cfg.h/user_settings.h for an integrator-accurate SBOM.
+# ---- SBOM generation (vendored wolfGlass driver) ----
+# Version comes from ChangeLog.md: there is no release version macro in the
+# public headers (WOLFHSM_CFG_INFOVERSION is a protocol info string, not the
+# product release). Parsing ChangeLog.md is a known fragility to fix later.
 #
-# ponytail: wh_settings.h pulls libc headers (stdint/stdio/strings/stdatomic),
-# so ~330 toolchain constants (INT16_MAX, ACCESSPERMS, ...) ride along into
-# the SBOM next to the ~175 real config macros. The dump is deliberately NOT
-# filtered here: a prefix allowlist would silently drop real options that
-# carry no standard prefix (GCM_TABLE_4BIT, FP_MAX_BITS, SINGLE_THREADED).
-# The durable fix belongs in gen-sbom's noise filter (wolfSSL PR #10343,
-# scripts/gen-sbom _NOISE_MACRO_RE), either of:
-#   a) provenance filtering: accept a -dD dump and use its #line markers to
-#      drop macros defined in system headers, or
-#   b) an --options-baseline flag: subtract a second -dM dump made with the
-#      same flags minus the -include, plus the libc headers it pulls.
-# Once gen-sbom grows that, this recipe needs no change — it already hands
-# over the full dump.
-	@_defines=$$(mktemp "$${TMPDIR:-/tmp}/wolfhsm-defines.XXXXXX") && \
-	trap 'rm -f "$$_defines"' 0 && \
-	if ! $(CC) -dM -E -DWOLFHSM_CFG -DWOLFSSL_USER_SETTINGS \
+# Config capture MUST use SBOM_OPTIONS_H, not SBOM_CFLAGS. The driver's
+# --cflags path keeps only -D tokens and drops -I / -include, so feeding
+# `-include wolfhsm/wh_settings.h` via SBOM_CFLAGS produced an empty SBOM
+# (two raw -D flags). Capture the expanded header the same way PR #414 did.
+WOLFSSL_DIR     ?= ../wolfssl
+HOSTCC          ?= cc
+SBOM_NAME       := wolfhsm
+SBOM_ROOT       := $(CURDIR)
+SBOM_SRCS       := $(sort $(wildcard src/*.c))
+SBOM_VERSION    := $(shell sed -n 's/^. wolfHSM Release v//p' ChangeLog.md | head -1 | cut -d' ' -f1)
+SBOM_LICENSE_FILE := $(CURDIR)/LICENSING
+SBOM_DEP_WOLFSSL  ?= yes
+SBOM_OPTIONS_H  := $(CURDIR)/.sbom-wolfhsm-defines.h
+
+# Enforce only when an SBOM goal was actually requested. A bare $(error) here
+# is evaluated while the Makefile is read, so it aborts every goal in the tree
+# — `make scan`, `make clean`, `make test` — not just the SBOM ones.
+ifneq (,$(filter sbom sbom-defines,$(MAKECMDGOALS)))
+ifeq ($(origin WOLFHSM_CFG_DIR),undefined)
+$(error WOLFHSM_CFG_DIR is required — point it at the directory \
+holding the wolfhsm_cfg.h/user_settings.h your build uses; do \
+not assume test/config is a release configuration)
+endif
+endif
+
+include tools/sbom/build/sbom.mk
+
+# Keep only project configuration macros. A raw -dM dump also carries the host
+# compiler's own builtins, and gen-sbom's scrub drops __-prefixed names but not
+# system macros whose *values* name them (ATOMIC_BOOL_LOCK_FREE expands to
+# __GCC_ATOMIC_BOOL_LOCK_FREE under gcc, __CLANG_ATOMIC_BOOL_LOCK_FREE under
+# clang), which made the SBOM toolchain-dependent.
+#
+# Object-like macros only: the trailing [[:space:]] excludes function-like ones,
+# whose bodies differ cosmetically between the two preprocessors ("idx ##VAR"
+# vs "idx##VAR"). A macro body is an implementation detail, not build config.
+#
+# The \# is required: an unescaped # would start a Make comment and silently
+# truncate this pattern to "^", which matches every line and filters nothing.
+SBOM_DEFINE_RE := ^\#define (WOLFHSM|WOLFSSL|WOLFCRYPT|WOLF|WC_|HAVE_|NO_|OPENSSL|USE_|SIZEOF_|FP_|TFM_|SP_|ECC_|RSA_|AES_|SHA|CURVE|ED25519|ED448|HKDF|KEEP_|SMALL_|BIG_|NDEBUG|DEBUG)[A-Za-z0-9_]*[[:space:]]
+
+# Always re-capture: a stale dump would hide config changes. The driver's
+# --cflags path cannot do this — it drops -I/-include.
+.PHONY: sbom-defines
+sbom-defines:
+	@echo "SBOM: capturing config via $(HOSTCC) -dM -E -include wolfhsm/wh_settings.h"
+	@$(HOSTCC) -dM -E -DWOLFHSM_CFG -DWOLFSSL_USER_SETTINGS \
 	    -I. -I$(WOLFHSM_CFG_DIR) -I$(WOLFSSL_DIR) \
-	    -include wolfhsm/wh_settings.h -x c /dev/null >"$$_defines"; then \
-	    echo "ERROR: $(CC) -dM -E on wolfhsm/wh_settings.h failed." >&2; exit 1; \
-	fi && \
-	if ! command -v python3 >/dev/null 2>&1; then \
-	    echo "ERROR: python3 not found." >&2; exit 1; \
-	fi && \
-	python3 $(WOLFSSL_DIR)/scripts/gen-sbom \
-	    --name wolfhsm \
-	    --version $(VERSION) \
-	    --supplier "wolfSSL Inc." \
-	    --license-file LICENSING \
-	    --options-h "$$_defines" \
-	    --srcs $(SRCS) \
-	    --cdx-out $(SBOM_CDX) \
-	    --spdx-out $(SBOM_SPDX)
-	@echo "Done: $(SBOM_CDX)  $(SBOM_SPDX)"
+	    -include wolfhsm/wh_settings.h -x c /dev/null \
+	  | LC_ALL=C grep -E '$(SBOM_DEFINE_RE)' \
+	  | LC_ALL=C sort > $(SBOM_OPTIONS_H)
+	@if [ ! -s $(SBOM_OPTIONS_H) ]; then \
+	    echo "ERROR: captured no configuration macros from" >&2; \
+	    echo "       WOLFHSM_CFG_DIR=$(WOLFHSM_CFG_DIR)" >&2; \
+	    echo "       Check that it holds the wolfhsm_cfg.h/user_settings.h" >&2; \
+	    echo "       your build uses." >&2; \
+	    rm -f $(SBOM_OPTIONS_H); \
+	    exit 1; \
+	fi
+
+sbom: sbom-defines

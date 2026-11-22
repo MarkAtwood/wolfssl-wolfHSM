@@ -35,13 +35,22 @@
 
 #include "wh_test_list.h"
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
 /* Test declarations and weak skip implementations. */
+WH_TEST_DECL(whTest_ClientDevId);
 WH_TEST_DECL(whTest_Comm);
 WH_TEST_DECL(whTest_Dma);
+WH_TEST_DECL(whTest_HwKeystore);
 WH_TEST_DECL(whTest_KeystoreReqSize);
+WH_TEST_DECL(whTest_MultiClient);
 WH_TEST_DECL(whTest_CertVerify);
+WH_TEST_DECL(whTest_HwKeystoreServer);
 WH_TEST_DECL(whTest_NvmOptional);
 WH_TEST_DECL(whTest_ClientCerts);
+WH_TEST_DECL(whTest_Counter);
 WH_TEST_DECL(whTest_Crypto_Aes);
 WH_TEST_DECL(whTest_CryptoAesKeyUsagePolicies);
 WH_TEST_DECL(whTest_Crypto_Cmac);
@@ -50,43 +59,92 @@ WH_TEST_DECL(whTest_Crypto_Ecc);
 WH_TEST_DECL(whTest_Crypto_Ed25519);
 WH_TEST_DECL(whTest_Crypto_Kdf);
 WH_TEST_DECL(whTest_Crypto_KeyPolicy);
+WH_TEST_DECL(whTest_Crypto_Lms);
 WH_TEST_DECL(whTest_Crypto_MlDsa);
 WH_TEST_DECL(whTest_Crypto_Rng);
 WH_TEST_DECL(whTest_Crypto_Rsa);
 WH_TEST_DECL(whTest_Crypto_Sha);
+WH_TEST_DECL(whTest_Crypto_Sha3);
+WH_TEST_DECL(whTest_Crypto_Xmss);
+WH_TEST_DECL(whTest_CryptoEcc256);
+WH_TEST_DECL(whTest_CryptoEd25519BufferTooSmall);
+WH_TEST_DECL(whTest_CryptoMlDsaBufferTooSmall);
+WH_TEST_DECL(whTest_CryptoRsaBufferTooSmall);
+WH_TEST_DECL(whTest_CryptoSha256);
+WH_TEST_DECL(whTest_She);
+WH_TEST_DECL(whTest_SheMasterEcuKeyFallback);
+WH_TEST_DECL(whTest_SheReqSizeChecking);
+WH_TEST_DECL(whTest_SheStateGate);
 WH_TEST_DECL(whTest_Echo);
+WH_TEST_DECL(whTest_NvmDma);
+WH_TEST_DECL(whTest_NvmOps);
 WH_TEST_DECL(whTest_ServerInfo);
 WH_TEST_DECL(whTest_WolfCryptTest);
+WH_TEST_DECL(whTest_AuthBadArgs);
+WH_TEST_DECL(whTest_AuthLogin);
+WH_TEST_DECL(whTest_AuthLogout);
+WH_TEST_DECL(whTest_AuthAddUser);
+WH_TEST_DECL(whTest_AuthDeleteUser);
+WH_TEST_DECL(whTest_AuthSetPermissions);
+WH_TEST_DECL(whTest_AuthSetCredentials);
+WH_TEST_DECL(whTest_AuthRequestAuthorization);
 
 const whTestCase whTestsMisc[] = {
+    { "whTest_ClientDevId",      whTest_ClientDevId },
     { "whTest_Comm",             whTest_Comm },
     { "whTest_Dma",              whTest_Dma },
     { "whTest_KeystoreReqSize",  whTest_KeystoreReqSize },
+    { "whTest_MultiClient",      whTest_MultiClient },
+    {"whTest_HwKeystore", whTest_HwKeystore},
 };
-const size_t whTestsMiscCount = sizeof(whTestsMisc) / sizeof(whTestsMisc[0]);
+const size_t whTestsMiscCount = ARRAY_SIZE(whTestsMisc);
 
 const whTestCase whTestsServer[] = {
-    {"whTest_CertVerify", whTest_CertVerify},
-    {"whTest_NvmOptional", whTest_NvmOptional},
+    { "whTest_CertVerify", whTest_CertVerify },
+    { "whTest_NvmOptional", whTest_NvmOptional },
+    { "whTest_SheMasterEcuKeyFallback", whTest_SheMasterEcuKeyFallback },
+    { "whTest_SheReqSizeChecking", whTest_SheReqSizeChecking },
+    { "whTest_HwKeystoreServer", whTest_HwKeystoreServer },
+    { "whTest_SheStateGate", whTest_SheStateGate },
 };
-const size_t whTestsServerCount = sizeof(whTestsServer) / sizeof(whTestsServer[0]);
+const size_t whTestsServerCount = ARRAY_SIZE(whTestsServer);
 
 const whTestCase whTestsClient[] = {
-    { "whTest_ClientCerts", whTest_ClientCerts },
-    { "whTest_Crypto_Aes", whTest_Crypto_Aes },
-    { "whTest_CryptoAesKeyUsagePolicies", whTest_CryptoAesKeyUsagePolicies },
-    { "whTest_Crypto_Cmac", whTest_Crypto_Cmac },
-    { "whTest_Crypto_Curve25519", whTest_Crypto_Curve25519 },
-    { "whTest_Crypto_Ecc", whTest_Crypto_Ecc },
-    { "whTest_Crypto_Ed25519", whTest_Crypto_Ed25519 },
-    { "whTest_Crypto_Kdf", whTest_Crypto_Kdf },
-    { "whTest_Crypto_KeyPolicy", whTest_Crypto_KeyPolicy },
-    { "whTest_Crypto_MlDsa", whTest_Crypto_MlDsa },
-    { "whTest_Crypto_Rng", whTest_Crypto_Rng },
-    { "whTest_Crypto_Rsa", whTest_Crypto_Rsa },
-    { "whTest_Crypto_Sha", whTest_Crypto_Sha },
-    { "whTest_Echo", whTest_Echo },
-    { "whTest_ServerInfo", whTest_ServerInfo },
-    { "whTest_WolfCryptTest", whTest_WolfCryptTest },
+    {"whTest_ClientCerts", whTest_ClientCerts},
+    {"whTest_Counter", whTest_Counter},
+    {"whTest_Crypto_Aes", whTest_Crypto_Aes},
+    {"whTest_CryptoAesKeyUsagePolicies", whTest_CryptoAesKeyUsagePolicies},
+    {"whTest_Crypto_Cmac", whTest_Crypto_Cmac},
+    {"whTest_Crypto_Curve25519", whTest_Crypto_Curve25519},
+    {"whTest_Crypto_Ecc", whTest_Crypto_Ecc},
+    {"whTest_Crypto_Ed25519", whTest_Crypto_Ed25519},
+    {"whTest_Crypto_Kdf", whTest_Crypto_Kdf},
+    {"whTest_Crypto_KeyPolicy", whTest_Crypto_KeyPolicy},
+    {"whTest_Crypto_Lms", whTest_Crypto_Lms},
+    {"whTest_Crypto_MlDsa", whTest_Crypto_MlDsa},
+    {"whTest_Crypto_Rng", whTest_Crypto_Rng},
+    {"whTest_Crypto_Rsa", whTest_Crypto_Rsa},
+    {"whTest_Crypto_Sha", whTest_Crypto_Sha},
+    {"whTest_Crypto_Sha3", whTest_Crypto_Sha3},
+    {"whTest_Crypto_Xmss", whTest_Crypto_Xmss},
+    {"whTest_CryptoEcc256", whTest_CryptoEcc256},
+    {"whTest_CryptoEd25519BufferTooSmall", whTest_CryptoEd25519BufferTooSmall},
+    {"whTest_CryptoMlDsaBufferTooSmall", whTest_CryptoMlDsaBufferTooSmall},
+    {"whTest_CryptoRsaBufferTooSmall", whTest_CryptoRsaBufferTooSmall},
+    {"whTest_CryptoSha256", whTest_CryptoSha256},
+    {"whTest_She", whTest_She},
+    {"whTest_Echo", whTest_Echo},
+    {"whTest_NvmDma", whTest_NvmDma},
+    {"whTest_NvmOps", whTest_NvmOps},
+    {"whTest_ServerInfo", whTest_ServerInfo},
+    {"whTest_WolfCryptTest", whTest_WolfCryptTest},
+    {"whTest_AuthBadArgs", whTest_AuthBadArgs},
+    {"whTest_AuthLogin", whTest_AuthLogin},
+    {"whTest_AuthLogout", whTest_AuthLogout},
+    {"whTest_AuthAddUser", whTest_AuthAddUser},
+    {"whTest_AuthDeleteUser", whTest_AuthDeleteUser},
+    {"whTest_AuthSetPermissions", whTest_AuthSetPermissions},
+    {"whTest_AuthSetCredentials", whTest_AuthSetCredentials},
+    {"whTest_AuthRequestAuthorization", whTest_AuthRequestAuthorization},
 };
-const size_t whTestsClientCount = sizeof(whTestsClient) / sizeof(whTestsClient[0]);
+const size_t whTestsClientCount = ARRAY_SIZE(whTestsClient);

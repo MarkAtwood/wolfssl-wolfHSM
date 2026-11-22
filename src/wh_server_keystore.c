@@ -70,6 +70,12 @@
 #ifdef WOLFSSL_HAVE_MLKEM
 #include "wolfssl/wolfcrypt/wc_mlkem.h"
 #endif
+#ifdef WOLFSSL_HAVE_LMS
+#include "wolfssl/wolfcrypt/wc_lms.h"
+#endif
+#ifdef WOLFSSL_HAVE_XMSS
+#include "wolfssl/wolfcrypt/wc_xmss.h"
+#endif
 
 static int _FindInCache(whServerContext* server, whKeyId keyId, int* out_index,
                         int* out_big, uint8_t** out_buffer,
@@ -153,6 +159,16 @@ static int _KeystoreCheckPolicy(whServerContext* server, whKsOp op,
     if ((server == NULL) || WH_KEYID_ISERASED(keyId)) {
         return WH_ERROR_BADARGS;
     }
+
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only keys are not keystore-managed: no keystore operation is
+     * permitted on them. Must be checked before the existence lookup below,
+     * since these keys are never in cache or NVM and some callers (e.g.
+     * GetCacheSlotChecked) deliberately tolerate WH_ERROR_NOTFOUND */
+    if (WH_KEYID_ISHW(keyId)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 
     /* Check cache first */
     ret = _FindInCache(server, keyId, NULL, NULL, NULL, &cacheMeta);
@@ -588,6 +604,66 @@ static int _ExportMlkemPublicKey(whServerContext* server, whKeyId keyId,
 }
 #endif /* WOLFSSL_HAVE_MLKEM */
 
+#ifdef WOLFSSL_HAVE_LMS
+/* Emit the raw LMS public key for a cached/committed key. Stateful private
+ * state stays in the HSM; only the public bytes leave. */
+static int _ExportLmsPublicKey(whServerContext* server, whKeyId keyId,
+    uint8_t* out, uint16_t* outSz)
+{
+    int    ret;
+    LmsKey key[1];
+    word32 pubLen = 0;
+
+    ret = wc_LmsKey_Init(key, NULL, INVALID_DEVID);
+    if (ret == 0) {
+        ret = wh_Server_LmsKeyCacheExport(server, keyId, key);
+        if (ret == WH_ERROR_OK) {
+            ret = wc_LmsKey_GetPubLen(key, &pubLen);
+        }
+        if (ret == WH_ERROR_OK) {
+            if (pubLen > (word32)*outSz) {
+                ret = WH_ERROR_NOSPACE;
+            }
+            else {
+                memcpy(out, key->pub, pubLen);
+                *outSz = (uint16_t)pubLen;
+            }
+        }
+        wc_LmsKey_Free(key);
+    }
+    return ret;
+}
+#endif /* WOLFSSL_HAVE_LMS */
+
+#ifdef WOLFSSL_HAVE_XMSS
+static int _ExportXmssPublicKey(whServerContext* server, whKeyId keyId,
+    uint8_t* out, uint16_t* outSz)
+{
+    int     ret;
+    XmssKey key[1];
+    word32  pubLen = 0;
+
+    ret = wc_XmssKey_Init(key, NULL, INVALID_DEVID);
+    if (ret == 0) {
+        ret = wh_Server_XmssKeyCacheExport(server, keyId, key);
+        if (ret == WH_ERROR_OK) {
+            ret = wc_XmssKey_GetPubLen(key, &pubLen);
+        }
+        if (ret == WH_ERROR_OK) {
+            if (pubLen > (word32)*outSz) {
+                ret = WH_ERROR_NOSPACE;
+            }
+            else {
+                memcpy(out, key->pk, pubLen);
+                *outSz = (uint16_t)pubLen;
+            }
+        }
+        wc_XmssKey_Free(key);
+    }
+    return ret;
+}
+#endif /* WOLFSSL_HAVE_XMSS */
+
 int wh_Server_KeystoreGetUniqueId(whServerContext* server, whNvmId* inout_id)
 {
     int     ret   = WH_ERROR_OK;
@@ -605,6 +681,13 @@ int wh_Server_KeystoreGetUniqueId(whServerContext* server, whNvmId* inout_id)
     if (type == WH_KEYTYPE_WRAPPED) {
         return WH_ERROR_BADARGS;
     }
+
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only key ids are assigned by the hardware backend */
+    if (type == WH_KEYTYPE_HW) {
+        return WH_ERROR_BADARGS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 
     /* try every index until we find a unique one, don't worry about capacity */
     for (id = WH_KEYID_IDMAX; id > WH_KEYID_ERASED; id--) {
@@ -666,6 +749,14 @@ int wh_Server_KeystoreGetCacheSlot(whServerContext* server, whKeyId keyId,
         return WH_ERROR_BADARGS;
     }
 
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only keys must never occupy a cache slot. This core check is
+     * the sole protection for the DMA cache path, which allocates its slot
+     * here without going through _KeystoreCacheKey */
+    if (WH_KEYID_ISHW(keyId)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 
     ret = _FindInCache(server, keyId, &idx, &isBig, &buf, &foundMeta);
     if (ret == WH_ERROR_OK) {
@@ -712,6 +803,19 @@ static int _KeystoreCacheKey(whServerContext* server, whNvmMetadata* meta,
         return WH_ERROR_BADARGS;
     }
 
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+    /* Checked calls must refuse access to the LMX/XMSS private key */
+    if (checked && wh_Crypto_IsStatefulSigPrivBlob(in, (uint16_t)meta->len)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only keys must never enter the key cache */
+    if (WH_KEYID_ISHW(meta->id)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
+
     if (checked) {
         ret = wh_Server_KeystoreGetCacheSlotChecked(server, meta->id, meta->len,
                                                     &slotBuf, &slotMeta);
@@ -745,6 +849,43 @@ int wh_Server_KeystoreCacheKeyChecked(whServerContext* server,
 {
     return _KeystoreCacheKey(server, meta, in, 1);
 }
+
+#ifndef WC_NO_RNG
+static int _KeystoreCacheRandomKey(whServerContext* server, whNvmMetadata* meta)
+{
+    uint8_t*       slotBuf;
+    whNvmMetadata* slotMeta;
+    int            ret;
+
+    /* make sure id and length are valid */
+    if ((server == NULL) || (meta == NULL) || (meta->len == 0) ||
+        WH_KEYID_ISERASED(meta->id) ||
+        ((meta->len > WOLFHSM_CFG_SERVER_KEYCACHE_BUFSIZE) &&
+         (meta->len > WOLFHSM_CFG_SERVER_KEYCACHE_BIG_BUFSIZE))) {
+        return WH_ERROR_BADARGS;
+    }
+
+    ret = wh_Server_KeystoreGetCacheSlotChecked(server, meta->id, meta->len,
+                                                &slotBuf, &slotMeta);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+
+    /* Fill the slot directly from the server RNG */
+    ret = wc_RNG_GenerateBlock(server->crypto->rng, slotBuf, meta->len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    memcpy((uint8_t*)slotMeta, (uint8_t*)meta, sizeof(whNvmMetadata));
+    _MarkKeyCommitted(_GetCacheContext(server, meta->id), meta->id, 0);
+
+    WH_DEBUG_SERVER_VERBOSE("hsmGenerateKey: cached keyid=0x%X, len=%u\n",
+                            meta->id, meta->len);
+
+    return WH_ERROR_OK;
+}
+#endif /* !WC_NO_RNG */
 
 static int _FindInCache(whServerContext* server, whKeyId keyId, int* out_index,
                         int* out_big, uint8_t** out_buffer,
@@ -794,6 +935,15 @@ int wh_Server_KeystoreFreshenKey(whServerContext* server, whKeyId keyId,
     if ((server == NULL) || WH_KEYID_ISERASED(keyId)) {
         return WH_ERROR_BADARGS;
     }
+
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only keys are never cached and are not usable through the
+     * keystore. The keywrap KEK path fetches them directly from the hardware
+     * keystore instead */
+    if (WH_KEYID_ISHW(keyId)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 
     /* Use local buffers to allow for optional (NULL) output parameters */
     cacheBufOut  = (outBuf != NULL) ? outBuf : (uint8_t**)&cacheBufLocal;
@@ -858,6 +1008,13 @@ int wh_Server_KeystoreReadKey(whServerContext* server, whKeyId keyId,
          (WH_KEYID_TYPE(keyId) != WH_KEYTYPE_SHE))) {
         return WH_ERROR_BADARGS;
     }
+
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only key material must never be read out of the server */
+    if (WH_KEYID_ISHW(keyId)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 
     /* Check the cache using unified function */
     ret = _FindInCache(server, keyId, NULL, NULL, &cacheBuffer, &cacheMeta);
@@ -953,6 +1110,13 @@ int wh_Server_KeystoreEvictKey(whServerContext* server, whNvmId keyId)
         return WH_ERROR_BADARGS;
     }
 
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only keys are never cached, so there is nothing to evict */
+    if (WH_KEYID_ISHW(keyId)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
+
     /* Get the appropriate cache context for this key */
     ctx = _GetCacheContext(server, keyId);
 
@@ -994,6 +1158,13 @@ int wh_Server_KeystoreCommitKey(whServerContext* server, whNvmId keyId)
         return WH_ERROR_ABORTED;
     }
 
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only keys must never be persisted to NVM */
+    if (WH_KEYID_ISHW(keyId)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
+
     /* Get the appropriate cache context for this key */
     ctx = _GetCacheContext(server, keyId);
 
@@ -1033,6 +1204,13 @@ int wh_Server_KeystoreEraseKey(whServerContext* server, whNvmId keyId)
         return WH_ERROR_ABORTED;
     }
 
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only keys are not keystore-managed and cannot be erased */
+    if (WH_KEYID_ISHW(keyId)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
+
     /* remove the key from the cache if present */
     (void)wh_Server_KeystoreEvictKey(server, keyId);
 
@@ -1057,6 +1235,13 @@ int wh_Server_KeystoreEraseKeyChecked(whServerContext* server, whNvmId keyId)
     if (WH_KEYID_TYPE(keyId) == WH_KEYTYPE_WRAPPED) {
         return WH_ERROR_ABORTED;
     }
+
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    /* Hardware-only keys are not keystore-managed and cannot be erased */
+    if (WH_KEYID_ISHW(keyId)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 
     /* remove the key from the cache if present, enforcing policy */
     ret = wh_Server_KeystoreEvictKeyChecked(server, keyId);
@@ -1146,18 +1331,79 @@ int wh_Server_KeystoreRevokeKey(whServerContext* server, whNvmId keyId)
 #ifndef NO_AES
 #ifdef HAVE_AESGCM
 
-static int _AesGcmKeyWrap(whServerContext* server, whKeyId serverKeyId,
-                          uint8_t* keyIn, uint16_t keySz,
-                          whNvmMetadata* metadataIn, uint8_t* wrappedKeyOut,
-                          uint16_t wrappedKeySz)
+/* Resolve the KEK for a keywrap operation. Hardware-only KEKs (TYPE=HW)
+ * are fetched from the server's hardware keystore into hwKekBuf, which the
+ * caller must keep local and zeroize after use; they carry no NVM metadata,
+ * so usage policy is delegated to the hardware keystore backend. All other
+ * KEKs are freshened into the key cache and, when enforceUsage is nonzero,
+ * must carry WH_NVM_FLAGS_USAGE_WRAP. */
+static int _KeywrapResolveKek(whServerContext* server, whKeyId serverKeyId,
+                              int enforceUsage, uint8_t* hwKekBuf,
+                              uint16_t hwKekBufSz, const uint8_t** outKek,
+                              uint32_t* outKekSz)
+{
+    int            ret;
+    whNvmMetadata* kekMeta = NULL;
+    uint8_t*       kek     = NULL;
+
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    if (WH_KEYID_ISHW(serverKeyId)) {
+        uint16_t hwKekSz = hwKekBufSz;
+        if (server->hwKeystore == NULL) {
+            /* No hardware keystore bound to this server */
+            return WH_ERROR_NOTFOUND;
+        }
+        ret = wh_HwKeystore_GetKey(server->hwKeystore, serverKeyId, hwKekBuf,
+                                   &hwKekSz);
+        if (ret == WH_ERROR_OK) {
+            *outKek   = hwKekBuf;
+            *outKekSz = hwKekSz;
+        }
+        return ret;
+    }
+#else
+    (void)hwKekBuf;
+    (void)hwKekBufSz;
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
+
+    ret = wh_Server_KeystoreFreshenKey(server, serverKeyId, &kek, &kekMeta);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+
+    if (enforceUsage) {
+        /* Validate key usage policy for wrapping (KEK) */
+        ret =
+            wh_Server_KeystoreEnforceKeyUsage(kekMeta, WH_NVM_FLAGS_USAGE_WRAP);
+        if (ret != WH_ERROR_OK) {
+            return ret;
+        }
+    }
+
+    *outKek   = kek;
+    *outKekSz = kekMeta->len;
+    return WH_ERROR_OK;
+}
+
+/* Size of the local storage each keywrap helper provides for a hardware-only
+ * KEK. Minimal when no hardware keystore is configured, since the resolver
+ * then never writes to it */
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+#define WH_KEYWRAP_HWKEK_BUF_SIZE WOLFHSM_CFG_HWKEYSTORE_MAX_KEY_SIZE
+#else
+#define WH_KEYWRAP_HWKEK_BUF_SIZE 1
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
+
+static int _AesGcmKeyWrapWithKek(whServerContext* server,
+                                 const uint8_t* serverKey, uint32_t serverKeySz,
+                                 uint8_t* keyIn, uint16_t keySz,
+                                 whNvmMetadata* metadataIn,
+                                 uint8_t* wrappedKeyOut, uint16_t wrappedKeySz)
 {
     int      ret = 0;
     Aes      aes[1];
     uint8_t  authTag[WH_KEYWRAP_AES_GCM_TAG_SIZE];
     uint8_t  iv[WH_KEYWRAP_AES_GCM_IV_SIZE];
-    uint8_t* serverKey;
-    uint32_t serverKeySz;
-    whNvmMetadata* serverKeyMetadata;
     uint8_t  plainBlob[sizeof(*metadataIn) + WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE];
     uint32_t plainBlobSz = sizeof(*metadataIn) + keySz;
     uint8_t* encBlob;
@@ -1171,21 +1417,6 @@ static int _AesGcmKeyWrap(whServerContext* server, whKeyId serverKeyId,
     if (wrappedKeySz <
         sizeof(iv) + sizeof(authTag) + sizeof(*metadataIn) + keySz) {
         return WH_ERROR_BUFFER_SIZE;
-    }
-
-    /* Get the server side key */
-    ret = wh_Server_KeystoreFreshenKey(server, serverKeyId,
-                                       &serverKey, &serverKeyMetadata);
-    if (ret != WH_ERROR_OK) {
-        return ret;
-    }
-    serverKeySz = serverKeyMetadata->len;
-
-    /* Validate key usage policy for wrapping (KEK) */
-    ret = wh_Server_KeystoreEnforceKeyUsage(serverKeyMetadata,
-                                            WH_NVM_FLAGS_USAGE_WRAP);
-    if (ret != WH_ERROR_OK) {
-        return ret;
     }
 
     /* Initialize AES context and set it to use the server side key */
@@ -1231,18 +1462,46 @@ static int _AesGcmKeyWrap(whServerContext* server, whKeyId serverKeyId,
     return WH_ERROR_OK;
 }
 
-static int _AesGcmKeyUnwrap(whServerContext* server, uint16_t serverKeyId,
-                            void* wrappedKeyIn, uint16_t wrappedKeySz,
-                            whNvmMetadata* metadataOut, void* keyOut,
-                            uint16_t keySz)
+static int _AesGcmKeyWrap(whServerContext* server, whKeyId serverKeyId,
+                          uint8_t* keyIn, uint16_t keySz,
+                          whNvmMetadata* metadataIn, uint8_t* wrappedKeyOut,
+                          uint16_t wrappedKeySz)
+{
+    int            ret;
+    const uint8_t* serverKey   = NULL;
+    uint32_t       serverKeySz = 0;
+    uint8_t        hwKek[WH_KEYWRAP_HWKEK_BUF_SIZE];
+
+    if (server == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Get the server side key (KEK) */
+    ret = _KeywrapResolveKek(server, serverKeyId, 1, hwKek,
+                             (uint16_t)sizeof(hwKek), &serverKey, &serverKeySz);
+    if (ret == WH_ERROR_OK) {
+        ret =
+            _AesGcmKeyWrapWithKek(server, serverKey, serverKeySz, keyIn, keySz,
+                                  metadataIn, wrappedKeyOut, wrappedKeySz);
+    }
+
+    /* Wipe any hardware KEK material from local storage */
+    wh_Utils_ForceZero(hwKek, sizeof(hwKek));
+
+    return ret;
+}
+
+static int _AesGcmKeyUnwrapWithKek(whServerContext* server,
+                                   const uint8_t*   serverKey,
+                                   uint32_t serverKeySz, void* wrappedKeyIn,
+                                   uint16_t       wrappedKeySz,
+                                   whNvmMetadata* metadataOut, void* keyOut,
+                                   uint16_t keySz)
 {
     int      ret = 0;
     Aes      aes[1];
     uint8_t  authTag[WH_KEYWRAP_AES_GCM_TAG_SIZE];
     uint8_t  iv[WH_KEYWRAP_AES_GCM_IV_SIZE];
-    uint8_t* serverKey;
-    uint32_t serverKeySz;
-    whNvmMetadata* serverKeyMetadata;
     uint8_t* encBlob;
     uint16_t encBlobSz;
     uint8_t  plainBlob[sizeof(*metadataOut) + WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE];
@@ -1259,22 +1518,6 @@ static int _AesGcmKeyUnwrap(whServerContext* server, uint16_t serverKeyId,
     encBlob   = (uint8_t*)wrappedKeyIn + sizeof(iv) + sizeof(authTag);
     encBlobSz = wrappedKeySz - sizeof(iv) - sizeof(authTag);
 
-
-    /* Get the server side key */
-    ret = wh_Server_KeystoreFreshenKey(server, serverKeyId,
-                                       &serverKey, &serverKeyMetadata);
-    if (ret != WH_ERROR_OK) {
-        return ret;
-    }
-    serverKeySz = serverKeyMetadata->len;
-
-    /* Validate key usage policy for unwrapping (KEK) */
-    ret = wh_Server_KeystoreEnforceKeyUsage(serverKeyMetadata,
-                                            WH_NVM_FLAGS_USAGE_WRAP);
-    if (ret != WH_ERROR_OK) {
-        return ret;
-    }
-
     /* Initialize AES context and set it to use the server side key */
     ret = wc_AesInit(aes, NULL, server->devId);
     if (ret != 0) {
@@ -1289,7 +1532,7 @@ static int _AesGcmKeyUnwrap(whServerContext* server, uint16_t serverKeyId,
 
     /* Extract IV and authTag from wrappedKeyIn */
     memcpy(iv, wrappedKeyIn, sizeof(iv));
-    memcpy(authTag, wrappedKeyIn + sizeof(iv), sizeof(authTag));
+    memcpy(authTag, (const uint8_t*)wrappedKeyIn + sizeof(iv), sizeof(authTag));
 
     /* Decrypt the encrypted blob */
     ret = wc_AesGcmDecrypt(aes, plainBlob, encBlob, encBlobSz, iv, sizeof(iv),
@@ -1307,17 +1550,45 @@ static int _AesGcmKeyUnwrap(whServerContext* server, uint16_t serverKeyId,
     return WH_ERROR_OK;
 }
 
-static int _AesGcmDataWrap(whServerContext* server, whKeyId serverKeyId,
-                           uint8_t* dataIn, uint16_t dataSz,
-                           uint8_t* wrappedDataOut, uint16_t wrappedDataSz)
+static int _AesGcmKeyUnwrap(whServerContext* server, uint16_t serverKeyId,
+                            void* wrappedKeyIn, uint16_t wrappedKeySz,
+                            whNvmMetadata* metadataOut, void* keyOut,
+                            uint16_t keySz)
+{
+    int            ret;
+    const uint8_t* serverKey   = NULL;
+    uint32_t       serverKeySz = 0;
+    uint8_t        hwKek[WH_KEYWRAP_HWKEK_BUF_SIZE];
+
+    if (server == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Get the server side key (KEK) */
+    ret = _KeywrapResolveKek(server, serverKeyId, 1, hwKek,
+                             (uint16_t)sizeof(hwKek), &serverKey, &serverKeySz);
+    if (ret == WH_ERROR_OK) {
+        ret = _AesGcmKeyUnwrapWithKek(server, serverKey, serverKeySz,
+                                      wrappedKeyIn, wrappedKeySz, metadataOut,
+                                      keyOut, keySz);
+    }
+
+    /* Wipe any hardware KEK material from local storage */
+    wh_Utils_ForceZero(hwKek, sizeof(hwKek));
+
+    return ret;
+}
+
+static int _AesGcmDataWrapWithKek(whServerContext* server,
+                                  const uint8_t*   serverKey,
+                                  uint32_t serverKeySz, uint8_t* dataIn,
+                                  uint16_t dataSz, uint8_t* wrappedDataOut,
+                                  uint16_t wrappedDataSz)
 {
     int      ret = 0;
     Aes      aes[1];
     uint8_t  authTag[WH_KEYWRAP_AES_GCM_TAG_SIZE];
     uint8_t  iv[WH_KEYWRAP_AES_GCM_IV_SIZE];
-    uint8_t* serverKey;
-    uint32_t serverKeySz;
-    whNvmMetadata* serverKeyMetadata;
     uint8_t* encBlob;
 
     if (server == NULL || dataIn == NULL || wrappedDataOut == NULL) {
@@ -1328,14 +1599,6 @@ static int _AesGcmDataWrap(whServerContext* server, whKeyId serverKeyId,
     if (wrappedDataSz < sizeof(iv) + sizeof(authTag) + dataSz) {
         return WH_ERROR_BUFFER_SIZE;
     }
-
-    /* Get the server side key */
-    ret = wh_Server_KeystoreFreshenKey(server, serverKeyId,
-                                       &serverKey, &serverKeyMetadata);
-    if (ret != WH_ERROR_OK) {
-        return ret;
-    }
-    serverKeySz = serverKeyMetadata->len;
 
     /* Initialize AES context and set it to use the server side key */
     ret = wc_AesInit(aes, NULL, server->devId);
@@ -1376,17 +1639,44 @@ static int _AesGcmDataWrap(whServerContext* server, whKeyId serverKeyId,
     return WH_ERROR_OK;
 }
 
-static int _AesGcmDataUnwrap(whServerContext* server, uint16_t serverKeyId,
-                             void* wrappedDataIn, uint16_t wrappedDataSz,
-                             void* dataOut, uint16_t dataSz)
+static int _AesGcmDataWrap(whServerContext* server, whKeyId serverKeyId,
+                           uint8_t* dataIn, uint16_t dataSz,
+                           uint8_t* wrappedDataOut, uint16_t wrappedDataSz)
+{
+    int            ret;
+    const uint8_t* serverKey   = NULL;
+    uint32_t       serverKeySz = 0;
+    uint8_t        hwKek[WH_KEYWRAP_HWKEK_BUF_SIZE];
+
+    if (server == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Get the server side key (KEK). Data wrap does not enforce usage flags
+     * on the KEK (existing behavior) */
+    ret = _KeywrapResolveKek(server, serverKeyId, 0, hwKek,
+                             (uint16_t)sizeof(hwKek), &serverKey, &serverKeySz);
+    if (ret == WH_ERROR_OK) {
+        ret = _AesGcmDataWrapWithKek(server, serverKey, serverKeySz, dataIn,
+                                     dataSz, wrappedDataOut, wrappedDataSz);
+    }
+
+    /* Wipe any hardware KEK material from local storage */
+    wh_Utils_ForceZero(hwKek, sizeof(hwKek));
+
+    return ret;
+}
+
+static int _AesGcmDataUnwrapWithKek(whServerContext* server,
+                                    const uint8_t*   serverKey,
+                                    uint32_t serverKeySz, void* wrappedDataIn,
+                                    uint16_t wrappedDataSz, void* dataOut,
+                                    uint16_t dataSz)
 {
     int      ret = 0;
     Aes      aes[1];
     uint8_t  authTag[WH_KEYWRAP_AES_GCM_TAG_SIZE];
     uint8_t  iv[WH_KEYWRAP_AES_GCM_IV_SIZE];
-    uint8_t*  serverKey;
-    uint32_t serverKeySz;
-    whNvmMetadata* serverKeyMetadata;
     uint8_t* encBlob;
     uint16_t encBlobSz;
 
@@ -1402,14 +1692,6 @@ static int _AesGcmDataUnwrap(whServerContext* server, uint16_t serverKeyId,
     encBlob   = (uint8_t*)wrappedDataIn + sizeof(iv) + sizeof(authTag);
     encBlobSz = wrappedDataSz - sizeof(iv) - sizeof(authTag);
 
-    /* Get the server side key */
-    ret = wh_Server_KeystoreFreshenKey(server, serverKeyId,
-                                       &serverKey, &serverKeyMetadata);
-    if (ret != WH_ERROR_OK) {
-        return ret;
-    }
-    serverKeySz = serverKeyMetadata->len;
-
     /* Initialize AES context and set it to use the server side key */
     ret = wc_AesInit(aes, NULL, server->devId);
     if (ret != 0) {
@@ -1424,7 +1706,7 @@ static int _AesGcmDataUnwrap(whServerContext* server, uint16_t serverKeyId,
 
     /* Extract IV and authTag from wrappedDataIn */
     memcpy(iv, wrappedDataIn, sizeof(iv));
-    memcpy(authTag, wrappedDataIn + sizeof(iv), sizeof(authTag));
+    memcpy(authTag, (const uint8_t*)wrappedDataIn + sizeof(iv), sizeof(authTag));
 
     /* Decrypt the encrypted blob */
     ret = wc_AesGcmDecrypt(aes, dataOut, encBlob, encBlobSz, iv, sizeof(iv),
@@ -1436,6 +1718,35 @@ static int _AesGcmDataUnwrap(whServerContext* server, uint16_t serverKeyId,
 
     wc_AesFree(aes);
     return WH_ERROR_OK;
+}
+
+static int _AesGcmDataUnwrap(whServerContext* server, uint16_t serverKeyId,
+                             void* wrappedDataIn, uint16_t wrappedDataSz,
+                             void* dataOut, uint16_t dataSz)
+{
+    int            ret;
+    const uint8_t* serverKey   = NULL;
+    uint32_t       serverKeySz = 0;
+    uint8_t        hwKek[WH_KEYWRAP_HWKEK_BUF_SIZE];
+
+    if (server == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Get the server side key (KEK). Data unwrap does not enforce usage
+     * flags on the KEK (existing behavior) */
+    ret = _KeywrapResolveKek(server, serverKeyId, 0, hwKek,
+                             (uint16_t)sizeof(hwKek), &serverKey, &serverKeySz);
+    if (ret == WH_ERROR_OK) {
+        ret = _AesGcmDataUnwrapWithKek(server, serverKey, serverKeySz,
+                                       wrappedDataIn, wrappedDataSz, dataOut,
+                                       dataSz);
+    }
+
+    /* Wipe any hardware KEK material from local storage */
+    wh_Utils_ForceZero(hwKek, sizeof(hwKek));
+
+    return ret;
 }
 
 #endif /* HAVE_AESGCM */
@@ -1751,6 +2062,14 @@ static int _HandleKeyUnwrapAndCacheRequest(
     /* Store the assigned key ID in the response, preserving client flags */
     resp->keyId = wh_KeyId_TranslateToClient(metadata.id);
 
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+    /* Stateful (LMS/XMSS) private key state must never enter the keystore via
+     * unwrap; that would permit a signature-index roll-back. */
+    if (wh_Crypto_IsStatefulSigPrivBlob(key, (uint16_t)metadata.len)) {
+        return WH_ERROR_ACCESS;
+    }
+#endif
+
     /* Cache the key */
     return wh_Server_KeystoreCacheKey(server, &metadata, key);
 }
@@ -1990,6 +2309,68 @@ int wh_Server_HandleKeyRequest(whServerContext* server, uint16_t magic,
             *out_resp_size = sizeof(resp);
         } break;
 
+        case WH_KEY_CACHE_RANDOM: {
+            whMessageKeystore_CacheRandomRequest  req  = {0};
+            whMessageKeystore_CacheRandomResponse resp = {0};
+
+            /* Validate req_size can hold the fixed request struct */
+            if (req_size < sizeof(req)) {
+                ret = WH_ERROR_BADARGS;
+            }
+
+            if (ret == WH_ERROR_OK) {
+                /* translate request */
+                (void)wh_MessageKeystore_TranslateCacheRandomRequest(
+                    magic, (whMessageKeystore_CacheRandomRequest*)req_packet,
+                    &req);
+
+                /* set the metadata fields (no key material is sent) */
+                meta->id = wh_KeyId_TranslateFromClient(
+                    WH_KEYTYPE_CRYPTO, server->comm->client_id, req.id);
+                meta->access = WH_NVM_ACCESS_ANY;
+                meta->flags  = req.flags;
+                meta->len    = req.sz;
+                /* truncate label if it's too large */
+                if (req.labelSz > WH_NVM_LABEL_LEN) {
+                    req.labelSz = WH_NVM_LABEL_LEN;
+                }
+                memcpy(meta->label, req.label, req.labelSz);
+            }
+
+#ifndef WC_NO_RNG
+            if (ret == WH_ERROR_OK) {
+                ret = WH_SERVER_NVM_LOCK(server);
+                if (ret == WH_ERROR_OK) {
+                    /* get a new id if one wasn't provided */
+                    if (WH_KEYID_ISERASED(meta->id)) {
+                        ret = wh_Server_KeystoreGetUniqueId(server, &meta->id);
+                    }
+                    /* generate the key from the server RNG and cache it */
+                    if (ret == WH_ERROR_OK) {
+                        ret = _KeystoreCacheRandomKey(server, meta);
+                    }
+
+                    (void)WH_SERVER_NVM_UNLOCK(server);
+                } /* WH_SERVER_NVM_LOCK() */
+            }
+#else
+            if (ret == WH_ERROR_OK) {
+                ret = WH_ERROR_NOTIMPL;
+            }
+#endif /* !WC_NO_RNG */
+
+            if (ret == WH_ERROR_OK) {
+                /* Translate server keyId back to client format with flags */
+                resp.id = wh_KeyId_TranslateToClient(meta->id);
+            }
+            resp.rc = ret;
+
+            (void)wh_MessageKeystore_TranslateCacheRandomResponse(
+                magic, &resp, (whMessageKeystore_CacheRandomResponse*)resp_packet);
+
+            *out_resp_size = sizeof(resp);
+        } break;
+
 #ifdef WOLFHSM_CFG_DMA
 
         case WH_KEY_CACHE_DMA: {
@@ -2180,6 +2561,18 @@ int wh_Server_HandleKeyRequest(whServerContext* server, uint16_t magic,
                                                         stage, &stageMax);
                             break;
                     #endif /* WOLFSSL_HAVE_MLKEM */
+                    #ifdef WOLFSSL_HAVE_LMS
+                        case WH_KEY_ALGO_LMS:
+                            ret = _ExportLmsPublicKey(server, serverKeyId,
+                                                      stage, &stageMax);
+                            break;
+                    #endif /* WOLFSSL_HAVE_LMS */
+                    #ifdef WOLFSSL_HAVE_XMSS
+                        case WH_KEY_ALGO_XMSS:
+                            ret = _ExportXmssPublicKey(server, serverKeyId,
+                                                       stage, &stageMax);
+                            break;
+                    #endif /* WOLFSSL_HAVE_XMSS */
                         default:
                             ret = WH_ERROR_BADARGS;
                             break;
@@ -2383,6 +2776,18 @@ int wh_Server_HandleKeyRequest(whServerContext* server, uint16_t magic,
                                                         out, &max_der);
                             break;
                     #endif /* WOLFSSL_HAVE_MLKEM */
+                    #ifdef WOLFSSL_HAVE_LMS
+                        case WH_KEY_ALGO_LMS:
+                            ret = _ExportLmsPublicKey(server, serverKeyId,
+                                                      out, &max_der);
+                            break;
+                    #endif /* WOLFSSL_HAVE_LMS */
+                    #ifdef WOLFSSL_HAVE_XMSS
+                        case WH_KEY_ALGO_XMSS:
+                            ret = _ExportXmssPublicKey(server, serverKeyId,
+                                                       out, &max_der);
+                            break;
+                    #endif /* WOLFSSL_HAVE_XMSS */
                         default:
                             ret = WH_ERROR_BADARGS;
                             break;
@@ -2815,6 +3220,13 @@ int _KeystoreCacheKeyDma(whServerContext* server, whNvmMetadata* meta,
     /* Copy key data using DMA */
     ret = whServerDma_CopyFromClient(server, buffer, keyAddr, meta->len,
                                      (whServerDmaFlags){0});
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+    /* Checked calls must refuse access to the LMX/XMSS private key */
+    if ((ret == 0) && checked &&
+        wh_Crypto_IsStatefulSigPrivBlob(buffer, (uint16_t)meta->len)) {
+        ret = WH_ERROR_ACCESS;
+    }
+#endif
     if (ret != 0) {
         /* Clear the slot on error */
         memset(buffer, 0, meta->len);

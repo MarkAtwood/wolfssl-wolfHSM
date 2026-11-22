@@ -21,6 +21,8 @@ This chapter provides a detailed overview of the high level features that wolfHS
     - [Key Cache, Key IDs, and NVM Backing Store](#key-cache-key-ids-and-nvm-backing-store)
     - [Global Keys](#global-keys)
     - [Wrapped Keys](#wrapped-keys)
+    - [Hardware-Only Keys](#hardware-only-keys)
+        - [Supported Components](#supported-components)
     - [Key Usage Policies](#key-usage-policies)
 - [Certificate Management](#certificate-management)
     - [Trusted Root Storage](#trusted-root-storage)
@@ -33,7 +35,7 @@ This chapter provides a detailed overview of the high level features that wolfHS
     - [Communication Layer](#communication-layer)
     - [Transport Backends](#transport-backends)
 - [DMA Support](#dma-support)
-    - [The DMA Crypto Device (`WH_DEV_ID_DMA`)](#the-dma-crypto-device-wh_dev_id_dma)
+    - [DMA Dispatch Mode (`wh_Client_SetDmaMode`)](#dma-dispatch-mode-wh_client_setdmamode)
     - [Pre-Access and Post-Access Callbacks](#pre-access-and-post-access-callbacks)
     - [Address Allowlisting](#address-allowlisting)
     - [32-bit vs. 64-bit Address Handling](#32-bit-vs-64-bit-address-handling)
@@ -82,7 +84,16 @@ wolfHSM uses wolfCrypt as its cryptographic provider on both sides of the client
 
 Clients can use the wolfCrypt API directly because of wolfCrypt's [crypto callback (cryptoCb)](https://www.wolfssl.com/documentation/manuals/wolfssl/chapter06.html#crypto-callbacks-cryptocb) framework. Crypto callbacks let you override selected algorithms at runtime by registering a callback against a device identifier (`devId`). Most wolfCrypt functions take a `devId`, and when it matches a registered device the call is dispatched through that callback instead of running locally.
 
-The wolfHSM client library registers a crypto callback that turns each supported wolfCrypt call into a request/response exchange with the server. The same wolfCrypt source can be retargeted to the HSM by changing only the `devId` — nothing else in the application changes. wolfHSM defines `WH_DEV_ID` for the server crypto device, and `WH_DEV_ID_DMA` when DMA support is compiled in; passing either to a wolfCrypt function routes the operation to the server.
+The wolfHSM client library registers a crypto callback that turns each supported wolfCrypt call into a request/response exchange with the server. The same wolfCrypt source can be retargeted to the HSM by changing only the `devId` — nothing else in the application changes. Each client context registers a device ID chosen by the application in the `.devId` field of `whClientConfig`; leaving the field `0` selects the default `WH_DEV_ID`. `wh_Client_Init()` registers the ID and binds it to that context, and `wh_Client_Cleanup()` unregisters it. At a wolfCrypt call site the application can either read the ID back from the context with the `WH_CLIENT_DEVID(client)` macro, or simply pass the same constant it placed in the config — convenient where the client context is not in scope. Because each client can own a distinct `devId`, a single process can run multiple client connections (to one server or several) and each wolfCrypt call is serviced by exactly the client whose `devId` it was initialized with; a multi-client process must configure a distinct, nonzero `devId` for every client.
+
+In addition to the configured per-client ID, every `wh_Client_Init()` registers the two process-global device IDs:
+
+- `WH_DEV_ID` is registered with the same unified callback as a configured `devId`, so it behaves identically — including honoring the [DMA dispatch mode](#dma-dispatch-mode-wh_client_setdmamode). It is also the ID a client is bound to when its config leaves `.devId` 0.
+- `WH_DEV_ID_DMA` (present only with `WOLFHSM_CFG_DMA`) is registered with the DMA-only callback: operations always use the DMA request forms, and algorithms without a DMA variant fail rather than falling back to the standard path. It is reserved for this purpose and is not valid as a configured `.devId`.
+
+The global IDs preserve the behavior of earlier wolfHSM releases: an application with a **single client per process** needs no devId configuration at all and can keep passing `WH_DEV_ID` (or `WH_DEV_ID_DMA`) straight to wolfCrypt functions, exactly as before — they are always registered and available after `wh_Client_Init()`. Because these registrations are process-global and keyed on the integer value, each `wh_Client_Init()` rebinds them to the most recently initialized client, and **any** client's `wh_Client_Cleanup()` unregisters them. In a multi-client process they are therefore unreliable and should not be passed to wolfCrypt; use the per-client configured IDs instead. Both values are overridable at compile time (see [Configuration](9-Configuration.md#cryptography-features)).
+
+Registered device IDs occupy slots in wolfCrypt's fixed-size crypto-callback table (`MAX_CRYPTO_DEVID_CALLBACKS`, default 8): the global IDs occupy one slot each, shared by all clients in the process (every init rebinds the same table entries), and each distinct configured `devId` adds one more. `wh_Client_Cleanup()` releases the client's slots. Applications that run many simultaneous clients in one process may need to raise the wolfCrypt limit.
 
 In effect the callback layer is a transparent RPC framework for wolfCrypt: clients write ordinary wolfCrypt code, and wolfHSM handles request marshaling, transport, dispatch, and response delivery underneath. It also makes prototyping easy — develop against a local wolfCrypt instance, then switch to the HSM by toggling one parameter once the server is available.
 
@@ -97,20 +108,21 @@ The wolfHSM server exposes the full set of wolfCrypt software algorithms, and th
 - **Random number generation**: DRBG/RNG backed by the server's entropy source
 - **Post-quantum cryptography**: ML-DSA (FIPS 204) and ML-KEM (FIPS 203)
 
-For the authoritative list of algorithms, parameter ranges, and options, see the [wolfCrypt API reference](https://www.wolfssl.com/documentation/manuals/wolfssl/index.html). An algorithm not yet wired through the crypto callback can still be used locally against the client's own wolfCrypt instance — only operations dispatched to `WH_DEV_ID` are offloaded.
+For the authoritative list of algorithms, parameter ranges, and options, see the [wolfCrypt API reference](https://www.wolfssl.com/documentation/manuals/wolfssl/index.html). An algorithm not yet wired through the crypto callback can still be used locally against the client's own wolfCrypt instance — only operations dispatched to the client's `devId` are offloaded.
 
 ### Referencing Keys by ID
 
 When a client offloads an operation, it usually does *not* send the key with the request. The key lives in the server [keystore](#keystore) under a numeric **key ID**, and the client refers to it by that ID alone. The bytes never cross the client/server boundary — the client holds only the ID, and the server looks up the material when it runs the operation. This is what lets an HSM guard a private key while still letting a client sign or decrypt with it.
 
-A wolfCrypt key object is tied to a server-side key ID with a per-algorithm `SetKeyId` call. Every offloaded algorithm has one — `wh_Client_RsaSetKeyId`, `wh_Client_EccSetKeyId`, `wh_Client_AesSetKeyId`, `wh_Client_Ed25519SetKeyId`, `wh_Client_Curve25519SetKeyId`, `wh_Client_CmacSetKeyId`, `wh_Client_MlDsaSetKeyId`, and so on (each with a matching `GetKeyId`). You initialize an ordinary wolfCrypt key struct with `WH_DEV_ID`, associate it with a key ID instead of loading key bytes, and call wolfCrypt as usual:
+A wolfCrypt key object is tied to a server-side key ID with a per-algorithm `SetKeyId` call. Every offloaded algorithm has one — `wh_Client_RsaSetKeyId`, `wh_Client_EccSetKeyId`, `wh_Client_AesSetKeyId`, `wh_Client_Ed25519SetKeyId`, `wh_Client_Curve25519SetKeyId`, `wh_Client_CmacSetKeyId`, `wh_Client_MlDsaSetKeyId`, and so on (each with a matching `GetKeyId`). You initialize an ordinary wolfCrypt key struct with the client's devId, associate it with a key ID instead of loading key bytes, and call wolfCrypt as usual:
 
 ```c
 RsaKey  rsa;
 whKeyId keyId = 4; /* keyId 4 must be resident on the server */
 
-/* Initialize the RSA key context to use wolfHSM offload via WH_DEV_ID */
-wc_InitRsaKey_ex(&rsa, NULL, WH_DEV_ID);
+/* Initialize the RSA key context to use wolfHSM offload via the
+ * devId of an initialized client context */
+wc_InitRsaKey_ex(&rsa, NULL, WH_CLIENT_DEVID(client));
 
 /* Bind the key object to the server-side key */
 wh_Client_RsaSetKeyId(&rsa, keyId);
@@ -126,7 +138,7 @@ The same ID can name a key the client just cached, one provisioned into NVM at t
 
 Many of the platforms wolfHSM targets ship a dedicated crypto accelerator alongside their secure core. The server can use these accelerators per-algorithm through the same crypto callback mechanism: a port-supplied callback, registered at server init, redirects supported operations to the vendor's hardware driver, and anything not implemented in hardware falls back to wolfCrypt software. Which algorithms are accelerated depends on the silicon and is documented in each platform's port.
 
-Clients control whether a given crypto request should prefer hardware or software execution through the **crypto affinity** API. Affinity is a per-client setting with two values:
+Clients control whether a given crypto request should prefer hardware or software execution through the **crypto affinity** API. This feature is compiled in only when `WOLFHSM_CFG_CRYPTO_AFFINITY` is defined; when it is not, the server always uses its configured device ID and the client API below is unavailable. Affinity is a per-client setting with two values:
 
 - `WH_CRYPTO_AFFINITY_HW` (default): the server attempts to execute the operation using the configured hardware crypto device. If the server was not configured with a valid hardware device ID, or if the requested algorithm is not implemented in hardware, the request transparently falls back to wolfCrypt's software implementation.
 - `WH_CRYPTO_AFFINITY_SW`: the server always executes the operation using wolfCrypt's software implementation, bypassing any registered hardware device.
@@ -238,6 +250,8 @@ wolfHSM ships with two reference flash drivers usable on host platforms and in t
 
 Vendor-supplied flash drivers ship with the platform ports under `port/<vendor>/`. New platforms are integrated into wolfHSM by implementing the `whFlashCb` callback set against the device's flash controller; nothing in the NVM library above this layer needs to change.
 
+**Write-through requirement (port maintainers).** wolfHSM's power-loss guarantees assume the port's `Program` and `Verify` callbacks are write-through to the physical medium: `Program` must make the data durable before it returns, and `Verify` must read back from the medium rather than from any volatile write cache. A backend that buffers writes in a cache that can be lost on power failure breaks this assumption — on the next boot a committed object can roll back to a prior value. For stateless key material this is only a durability concern, but for **stateful or monotonic objects it is a security issue**: a rolled-back LMS or XMSS private key reuses a one-time signature index, enabling forgery, and a rolled-back monotonic counter defeats anti-rollback and replay protection. wolfHSM cannot detect or enforce this property, so a port whose flash controller caches writes must either disable that caching or issue an explicit flush before `Program`/`Verify` return.
+
 ### Optional NVM Backing
 
 The NVM subsystem described above is **optional**. A server can be initialized with `whServerConfig.nvm == NULL`, in which case it runs with no persistent object store at all. This suits clients and cores that only need cached-key cryptography and have no flash available for an NVM partition — at the cost of a reduced feature set, since everything that depends on persistent storage becomes unavailable.
@@ -299,9 +313,10 @@ The two tiers keep one large key (e.g. an an ML-DSA-87 private key) from dictati
 
 Each cached key carries its full `whNvmMetadata` record alongside the key bytes, plus an internal **committed flag** marking whether a copy also exists in NVM. This flag is what makes the cache a true working set: when it needs a slot and none is free, the keystore evicts a key that is already committed (and can be reloaded later), but never an uncommitted one. Uncommitted keys are RAM-only, so the caller must commit them to survive eviction or reset; if the cache fills with uncommitted keys, the next cache operation returns `WH_ERROR_NOSPACE` instead of silently dropping material.
 
-A client drives this tier with five operations:
+A client drives this tier with six operations:
 
 - **Cache**: write key bytes and metadata into a server cache slot. The key is usable immediately but RAM-only.
+- **Cache Random**: have the server generate a random key from its own RNG and cache it into a server cache slot.
 - **Commit**: copy a cached key into NVM as a durable object. The cache copy is marked committed and becomes a candidate for eviction.
 - **Evict**: drop the cache copy. If the key was committed, the NVM copy remains and reloads on the next reference; if it was uncommitted, the key is gone.
 - **Export**: read a cached key's bytes back to the client, subject to `WH_NVM_FLAGS_NONEXPORTABLE`.
@@ -357,6 +372,30 @@ In all three operations the KEK is identified by its existing keyId in the keyst
 A parallel pair of APIs — `wh_Client_DataWrap` and `wh_Client_DataUnwrap` — applies the same construction to arbitrary application data rather than key material. These are useful when a client needs the same authenticated-encryption guarantee for non-key payloads using a key resident in the HSM.
 
 > **Note**: Wrapped key identifiers are signaled on the wire by setting `WH_KEYID_CLIENT_WRAPPED_FLAG` (bit 9) in the request keyId, which the server translates internally to `WH_KEYTYPE_WRAPPED`. Clients construct wrapped-key identifiers using `WH_CLIENT_KEYID_MAKE_WRAPPED()`, and the combined wrapped-and-global form using `WH_CLIENT_KEYID_MAKE_WRAPPED_GLOBAL()`; both are defined in `wolfhsm/wh_client.h`.
+
+### Hardware-Only Keys
+
+Some platforms provide key material that the HSM core can read but that never lives in the wolfHSM keystore at all — KEKs burned into OTP or fuses, keys held by an SoC key-management block, or other hardware-provisioned secrets. The optional **hardware keystore front-end** (`WOLFHSM_CFG_HWKEYSTORE`) lets clients reference such keys as KEKs in [wrapped-key](#wrapped-keys) operations while guaranteeing the material never enters the key cache, never touches NVM, and is never returned to a client.
+
+The front-end (`wolfhsm/wh_hwkeystore.h`) is a platform-agnostic, fully configurable abstraction over the hardware keystore, following the same backend-callback-table paradigm as the [lock abstraction](#the-lock-abstraction) and logging modules. A backend provides a `whHwKeystoreCb` callback table whose required `GetKey` callback copies a requested key's bytes into a caller-provided buffer on demand, plus optional `Init` and `Cleanup` callbacks for backend setup/teardown. The callback table, an opaque backend context and config (for backend-specific state), and a lock (serializing callback invocations when the backing hardware is shared across server threads under `WOLFHSM_CFG_THREADSAFE`) are described by a `whHwKeystoreConfig` and held in a `whHwKeystoreContext`. The server application initializes the context once with `wh_HwKeystore_Init()` — which binds the callback table and invokes the backend `Init` callback if present — and binds it to one or more server contexts through the optional `hwKeystore` member of `whServerConfig`, the same ownership pattern as the NVM context.
+
+Clients designate a hardware-only key by setting `WH_KEYID_CLIENT_HW_FLAG` (bit 10) in the request keyId, normally via the `WH_CLIENT_KEYID_MAKE_HW()` macro in `wolfhsm/wh_client.h`. The server translates the flag to the internal key type `WH_KEYTYPE_HW` and routes accordingly:
+
+- In the keywrap operations (key wrap, unwrap-and-export, unwrap-and-cache, and data wrap/unwrap), a hardware-only KEK id causes the server to fetch the KEK from the hardware keystore into a local stack buffer via `wh_HwKeystore_GetKey()`, perform the AES-GCM operation, and zeroize the buffer before returning. The KEK is never cached and never appears in any response. An unwrap-and-cache under a hardware KEK still caches the unwrapped payload — the payload is an ordinary key; only the KEK is hardware-resident.
+- Everywhere else — key cache, export (including the public-only and DMA variants), commit, evict, erase, revoke, and every wolfCrypt operation routed through the crypto callback — a hardware-only keyId is rejected with `WH_ERROR_ACCESS`.
+
+Because hardware-only keys carry no `whNvmMetadata`, the [usage-flag policy machinery](#key-usage-policies) does not apply to them. The largest key the keywrap path will fetch from the backend is bounded by `WOLFHSM_CFG_HWKEYSTORE_MAX_KEY_SIZE` (default 32 bytes, sized for an AES-256 KEK), which should be respected (or enforced), by the port layer.
+
+#### Supported Components
+
+Hardware-only keys can be consumed by exactly one wolfHSM component today — the **[keywrap](#wrapped-keys) API**, where a `WH_CLIENT_KEYID_MAKE_HW()` id names the KEK. The supported operations are:
+
+- **Key wrap** (`wh_Client_KeyWrap`) — wrap a client-supplied key under the hardware-resident KEK.
+- **Key unwrap-and-export** (`wh_Client_KeyUnwrapAndExport`) — unwrap a blob and return the recovered key to the client.
+- **Key unwrap-and-cache** (`wh_Client_KeyUnwrapAndCache`) — unwrap a blob into the key cache; only the KEK is hardware-resident, while the unwrapped payload becomes an ordinary cached key.
+- **Data wrap and unwrap** (`wh_Client_DataWrap`, `wh_Client_DataUnwrap`) — apply the same authenticated encryption to arbitrary application data.
+
+No other component can name a hardware-only key: a direct wolfCrypt operation through the crypto callback, or any keystore lifecycle operation (cache, export, commit, evict, erase, revoke), is rejected with `WH_ERROR_ACCESS`. **Support is limited to keywrap KEK usage for now** — broader use, such as referencing a hardware-only key directly in a crypto operation, may be added in a future release.
 
 ### Key Usage Policies
 
@@ -496,6 +535,7 @@ wolfHSM ships with several reference transports that between them cover the most
 - **POSIX TCP transport** (`port/posix/posix_transport_tcp.h`): carries the packet exchange over a length-prefixed TCP stream. The server listens on a configured port and the client connects to it. This is the default transport for the POSIX server example and the recommended development transport, because the client and server can live in separate host processes — or on separate machines — without any additional platform integration.
 - **POSIX shared memory transport** (`port/posix/posix_transport_shm.h`): hosts the same request/response buffer layout used by the memory buffer transport in a named POSIX shared memory object, with optional space for DMA-style buffers alongside it. This lets the client and server run as independent processes on the same host while exercising the shared-memory code paths a multi-core SoC would use in production.
 - **TLS-over-TCP transport** (`port/posix/posix_transport_tls.h`): wraps the POSIX TCP transport in a wolfSSL-secured channel, with support for certificate-based authentication and PSK. It is intended for deployments where the client and server are physically separated and the link between them cannot be trusted. The packet framing above the TLS session is identical to the plain TCP transport, so higher-level code does not change between the two.
+- **ARMv8-M TrustZone NSC bridge transport** (`port/armv8m-tz/wh_transport_nsc.h`): a synchronous transport for ARMv8-M Cortex-M parts where the server runs in the secure world and clients run in the non-secure world. The non-secure client `Send` calls a single `cmse_nonsecure_entry` veneer (`wcs_wolfhsm_transmit`) the integrator provides; that veneer hands the request to the secure-side server inline and returns the response in the same call, which `Recv` then yields. There is no polling or shared-memory ring. The transport is target-agnostic across ARMv8-M parts; the veneer, flash/NVM adapter, and server init are supplied by the secure-side integration. The reference integration is the wolfBoot STM32H5 port.
 
 Beyond the reference transports, platform ports for embedded targets typically supply hardware-specific transports — silicon mailboxes, interrupt-driven inter-core channels, vendor IPC blocks — by implementing the same callback interface. The comm-layer contract is purely "deliver one packet, in order," so a transport need only marshal bytes between the two sides.
 
@@ -519,9 +559,11 @@ The motivating use cases all involve payloads that are either too large or too i
 - **Certificate chain verification** (see [DMA Variants](#dma-variants)) where the chain itself may be several kilobytes and the application already holds it in its own memory.
 - **In-place image verification** by the [image manager](#image-manager), which is the canonical case: the image being authenticated is already mapped in flash or RAM, and copying it through the comm buffer would defeat the purpose.
 
-### The DMA Crypto Device (`WH_DEV_ID_DMA`)
+### DMA Dispatch Mode (`wh_Client_SetDmaMode`)
 
-For wolfCrypt-mediated operations, opt-in to DMA is a single change at the call site: instead of passing `WH_DEV_ID` as the device identifier, the client passes `WH_DEV_ID_DMA`. Both device IDs route to the wolfHSM client crypto callback, but the DMA device tells the callback to construct a DMA-flavored request whose payload carries pointers and lengths into the client's address space rather than inline data. The server-side dispatcher recognizes the DMA request kind and, for each referenced buffer, hands the pointer to the server's DMA address-processing path (described below) before invoking the underlying wolfCrypt primitive. The set of algorithms that have a DMA path mirrors the most performance-sensitive subset of the supported algorithms; algorithms without a DMA path return an unsupported error if invoked with `WH_DEV_ID_DMA`, and the application can fall back to the standard `WH_DEV_ID` for those.
+For wolfCrypt-mediated operations, opt-in to DMA is a per-client dispatch mode rather than a separate device ID: the application calls `wh_Client_SetDmaMode(client, 1)` (or sets `.preferDma` in the client's `whClientDmaConfig` at init), and subsequent wolfCrypt calls made with `WH_CLIENT_DEVID(client)` construct DMA-flavored requests whose payloads carry pointers and lengths into the client's address space rather than inline data. The server-side dispatcher recognizes the DMA request kind and, for each referenced buffer, hands the pointer to the server's DMA address-processing path (described below) before invoking the underlying wolfCrypt primitive. The set of algorithms that have a DMA path mirrors the most performance-sensitive subset of the supported algorithms; with DMA mode preferred, an algorithm without a DMA path automatically falls back to the standard (non-DMA) request, so no call-site changes are needed. The mode can be toggled at any time — `wh_Client_SetDmaMode(client, 0)` returns the client to standard dispatch, and `wh_Client_GetDmaMode()` reads the current setting.
+
+The global `WH_DEV_ID_DMA` device ID is also always registered when `WOLFHSM_CFG_DMA` is enabled and always produces DMA-flavored requests for the most recently initialized client; unlike the DMA dispatch mode, it does not fall back to the standard path for algorithms without a DMA variant. See [Transparent Offload via Crypto Callbacks](#transparent-offload-via-crypto-callbacks) for the global device IDs' single-client-per-process scope.
 
 For the non-crypto subsystems (NVM, certificate manager, image manager, key cache/export, and the data-wrap API) the DMA-aware request kinds are exposed as `*Dma` variants of the corresponding client API functions — `wh_Client_NvmAddObjectDma`, `wh_Client_KeyCacheDma`, `wh_Client_KeyExportDma`, `wh_Client_CertVerifyDma`, and so on. See the [client API reference](10-API-docs-client.md) for the full set.
 

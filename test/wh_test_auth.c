@@ -45,7 +45,8 @@
 #include "wh_test_auth.h"
 #endif /* WOLFHSM_CFG_ENABLE_AUTHENTICATION */
 
-#if defined(WOLFHSM_CFG_TEST_CLIENT_ONLY_TCP)
+#if defined(WOLFHSM_CFG_TEST_CLIENT_ONLY_TCP) && \
+    defined(WOLFHSM_CFG_TEST_POSIX)
 #include "port/posix/posix_transport_tcp.h"
 #endif
 
@@ -89,6 +90,7 @@ static whNvmContext          nvm[1]    = {{0}};
 /* Test-specific authorization override callbacks to verify they are invoked */
 static int test_checkRequestAuthorizationCalled = 0;
 static int test_checkKeyAuthorizationCalled     = 0;
+static int test_logoutCallCount                 = 0;
 
 static int test_CheckRequestAuthorization(void* context, int err,
                                           uint16_t user_id, uint16_t group,
@@ -115,12 +117,20 @@ static int test_CheckKeyAuthorization(void* context, int err, uint16_t user_id,
     return err;
 }
 
+/* Counts Logout calls for the abrupt-disconnect test. */
+static int test_Logout(void* context, uint16_t current_user_id,
+                       uint16_t user_id)
+{
+    test_logoutCallCount++;
+    return wh_Auth_BaseLogout(context, current_user_id, user_id);
+}
+
 /* Auth setup following wh_posix_server pattern */
 static whAuthCb default_auth_cb = {
     .Init                      = wh_Auth_BaseInit,
     .Cleanup                   = wh_Auth_BaseCleanup,
     .Login                     = wh_Auth_BaseLogin,
-    .Logout                    = wh_Auth_BaseLogout,
+    .Logout                    = test_Logout,
     .CheckRequestAuthorization = test_CheckRequestAuthorization,
     .CheckKeyAuthorization     = test_CheckKeyAuthorization,
     .UserAdd                   = wh_Auth_BaseUserAdd,
@@ -141,6 +151,10 @@ static int _whTest_Auth_SetupMemory(whClientContext** out_client)
     whAuthPermissions permissions;
     uint16_t          out_user_id;
     int               i;
+
+    /* Reset so logout-count assertions are self-contained across repeated
+     * invocations of the suite in a single process. */
+    test_logoutCallCount = 0;
 
     /* Initialize transport memory config - avoid compound literals for C90 */
     tmcf->req       = (whTransportMemCsr*)req_buffer;
@@ -1409,9 +1423,13 @@ int whTest_AuthSetCredentials(whClientContext* client)
     WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
     WH_TEST_ASSERT_RETURN(test_user_id == user_id);
 
-    /* Cleanup */
+    /* Cleanup: remove the test user (logged in as admin so the delete
+     * is authorized). */
     _whTest_Auth_LogoutOp(client, test_user_id, &server_rc);
+    WH_TEST_RETURN_ON_FAIL(_whTest_Auth_LoginOp(
+        client, WH_AUTH_METHOD_PIN, "admin", "1234", 4, &server_rc, &admin_id));
     _whTest_Auth_DeleteUserByName(client, "testuser4");
+    _whTest_Auth_LogoutOp(client, admin_id, &server_rc);
 
     return WH_TEST_SUCCESS;
 }
@@ -1540,7 +1558,7 @@ int whTest_AuthRequestAuthorization(whClientContext* client)
     memset(&perms, 0, sizeof(perms));
     WH_AUTH_SET_ALLOWED_ACTION(perms, WH_MESSAGE_GROUP_AUTH,
                                WH_MESSAGE_AUTH_ACTION_USER_ADD);
-    /* Free slot: noauthuser no longer needed (WH_AUTH_BASE_MAX_USERS=5) */
+    /* Free a slot so the adds below stay within WH_AUTH_BASE_MAX_USERS (5) */
     _whTest_Auth_DeleteUserByName(client, "noauthuser");
     WH_TEST_RETURN_ON_FAIL(
         _whTest_Auth_UserAddOp(client, "alloweduser", perms, WH_AUTH_METHOD_PIN,
@@ -1560,7 +1578,9 @@ int whTest_AuthRequestAuthorization(whClientContext* client)
     temp_id3  = WH_USER_ID_INVALID;
     _whTest_Auth_UserAddOp(client, "testuser8", perms, WH_AUTH_METHOD_PIN,
                            "test", 4, &server_rc, &temp_id3);
-    WH_TEST_ASSERT_RETURN(server_rc != WH_ERROR_OK);
+    /* alloweduser holds the USER_ADD action, so the add is authorized */
+    WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
+    WH_TEST_ASSERT_RETURN(temp_id3 != WH_USER_ID_INVALID);
 
     /* Test 5: Logged in as different user and not allowed */
     WH_TEST_PRINT("  Test: Logged in as different user and not allowed\n");
@@ -1749,6 +1769,41 @@ int whTest_AuthTCP(whClientConfig* clientCfg)
 }
 
 
+#if !defined(WOLFHSM_CFG_TEST_CLIENT_ONLY_TCP) && \
+    defined(WOLFHSM_CFG_ENABLE_SERVER)
+static int AuthAbruptDisconnect(whClientContext* client_ctx)
+{
+    int32_t  server_rc      = 0;
+    whUserId user_id        = WH_USER_ID_INVALID;
+    int      logouts_before = 0;
+
+    WH_TEST_PRINT("  Test: Abrupt disconnect calls wh_Auth_Logout\n");
+
+    WH_TEST_RETURN_ON_FAIL(_whTest_Auth_LoginOp(
+        client_ctx, WH_AUTH_METHOD_PIN, TEST_ADMIN_USERNAME, TEST_ADMIN_PIN,
+        strlen(TEST_ADMIN_PIN), &server_rc, &user_id));
+    WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
+    WH_TEST_ASSERT_RETURN(user_id != WH_USER_ID_INVALID);
+    WH_TEST_ASSERT_RETURN(auth_ctx.user.user_id == user_id);
+    WH_TEST_ASSERT_RETURN(auth_ctx.user.is_active);
+
+    logouts_before = test_logoutCallCount;
+    WH_TEST_RETURN_ON_FAIL(
+        wh_Server_SetConnected(server, WH_COMM_DISCONNECTED));
+    WH_TEST_ASSERT_RETURN(test_logoutCallCount == logouts_before + 1);
+    WH_TEST_ASSERT_RETURN(auth_ctx.user.user_id == WH_USER_ID_INVALID);
+    WH_TEST_ASSERT_RETURN(!auth_ctx.user.is_active);
+
+    /* Repeat disconnect is a no-op. */
+    logouts_before = test_logoutCallCount;
+    WH_TEST_RETURN_ON_FAIL(
+        wh_Server_SetConnected(server, WH_COMM_DISCONNECTED));
+    WH_TEST_ASSERT_RETURN(test_logoutCallCount == logouts_before);
+
+    return WH_TEST_SUCCESS;
+}
+#endif /* memory transport */
+
 int whTest_AuthMEM(void)
 {
 #if !defined(WOLFHSM_CFG_TEST_CLIENT_ONLY_TCP) && \
@@ -1758,11 +1813,15 @@ int whTest_AuthMEM(void)
     /* Memory transport mode */
     WH_TEST_RETURN_ON_FAIL(_whTest_Auth_SetupMemory(&client_ctx));
     WH_TEST_RETURN_ON_FAIL(whTest_AuthTest(client_ctx));
+    WH_TEST_RETURN_ON_FAIL(AuthAbruptDisconnect(client_ctx));
 
     /* Verify that authorization callbacks were invoked during tests */
     WH_TEST_PRINT(
         "Verifying authorization override callbacks were called...\n");
     WH_TEST_ASSERT_RETURN(test_checkRequestAuthorizationCalled > 0);
+
+    /* Note that CheckKeyAuthorization is not implemented yet, so 
+     * test_checkKeyAuthorizationCalled is not checked here. */
 
     WH_TEST_RETURN_ON_FAIL(_whTest_Auth_CleanupMemory());
 

@@ -40,12 +40,27 @@
  *  keys to be shared across multiple clients
  *      Default: Not defined
  *
+ *  WOLFHSM_CFG_CRYPTO_AFFINITY - If defined, enable per-client crypto affinity,
+ *  allowing a client to request that crypto operations run on the server's
+ *  hardware device (WH_CRYPTO_AFFINITY_HW) or in software
+ *  (WH_CRYPTO_AFFINITY_SW). When not defined, the server always uses its
+ *  configured devId and the affinity request header field is ignored.
+ *      Default: Not defined
+ *
  *  WOLFHSM_CFG_KEYWRAP - If defined, include the key wrap functionality
  *      Default: Not defined
  *
  *  WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE - The maximum size (in bytes) of a key that
  *  can be wrapped
  *      Default: 512
+ *
+ *  WOLFHSM_CFG_HWKEYSTORE - If defined, include the hardware keystore
+ *  front-end module and hardware-only key (WH_KEYTYPE_HW) support
+ *      Default: Not defined
+ *
+ *  WOLFHSM_CFG_HWKEYSTORE_MAX_KEY_SIZE - The maximum size (in bytes) of a key
+ *  served by a hardware keystore backend
+ *      Default: 32
  *
  *  WOLFHSM_CFG_HEXDUMP - If defined, include wh_Utils_HexDump functionality
  *                          using stdio.h
@@ -245,8 +260,8 @@
 
 /* Size in bytes of each big key cache buffer  */
 #ifndef WOLFHSM_CFG_SERVER_KEYCACHE_BIG_BUFSIZE
-#ifdef WOLFSSL_HAVE_MLDSA
-/* If MLDSA enabled, default to large enough to hold the largest MLDSA key */
+#if defined(WOLFSSL_HAVE_MLDSA) || defined(WOLFSSL_HAVE_XMSS) || \
+    defined(WOLFSSL_HAVE_LMS)
 #define WOLFHSM_CFG_SERVER_KEYCACHE_BIG_BUFSIZE 8192
 #else
 /* Sane default to hold ASN.1 RSA 4096 public+private key */
@@ -463,6 +478,18 @@
 #if defined(WOLFHSM_CFG_NO_CRYPTO) && defined(WOLFHSM_CFG_KEYWRAP)
 #error "WOLFHSM_CFG_KEYWRAP is incompatible with WOLFHSM_CFG_NO_CRYPTO"
 #endif
+
+/* Crypto affinity selects the devId used for crypto operations, so it has no
+ * meaning without wolfCrypt. */
+#if defined(WOLFHSM_CFG_NO_CRYPTO) && defined(WOLFHSM_CFG_CRYPTO_AFFINITY)
+#error "WOLFHSM_CFG_CRYPTO_AFFINITY is incompatible with WOLFHSM_CFG_NO_CRYPTO"
+#endif
+
+#if defined(WOLFHSM_CFG_HWKEYSTORE)
+#ifndef WOLFHSM_CFG_HWKEYSTORE_MAX_KEY_SIZE
+#define WOLFHSM_CFG_HWKEYSTORE_MAX_KEY_SIZE 32
+#endif
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 
 /* Trusted cert verify cache requires the certificate manager and crypto.
  * Enforce here so downstream code can gate on

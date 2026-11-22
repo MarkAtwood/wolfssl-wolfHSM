@@ -53,6 +53,9 @@
 #include "wolfssl/wolfcrypt/wc_mldsa.h"
 #include "wolfssl/wolfcrypt/wc_mlkem.h"
 #include "wolfssl/wolfcrypt/hmac.h"
+#ifdef WOLFSSL_SHA3
+#include "wolfssl/wolfcrypt/sha3.h"
+#endif
 
 /**
  * @brief Generate random bytes
@@ -2637,6 +2640,131 @@ int wh_Client_Sha512DmaFinalResponse(whClientContext* ctx, wc_Sha512* sha,
 
 #endif /* WOLFSSL_SHA512 */
 
+#if defined(WOLFSSL_SHA3)
+/* SHA3 client API.
+ *
+ * SHA3 has 4 fixed-output variants (224/256/384/512), all backed by the
+ * single wolfCrypt wc_Sha3 struct. The client API mirrors the wolfCrypt
+ * surface (wc_Sha3_<V>_Update/Final), with per-variant public functions
+ * sharing internal helpers parameterized by hash type and block size.
+ *
+ * Block sizes:  144 / 136 / 104 / 72  for 224 / 256 / 384 / 512
+ * Digest sizes:  28 /  32 /  48 / 64
+ *
+ * State buffering: the client uses sha3->t[0..i-1] and sha3->i as the
+ * partial-block buffer (analogous to sha256->buffer/buffLen). Non-final
+ * Update requests carry whole blocks only; Final carries any partial
+ * tail inline.
+ *
+ * Async contract (per-variant): at most one outstanding async request
+ * may be in flight per whClientContext. If UpdateRequest returns
+ * *requestSent == true, the caller MUST call the matching UpdateResponse
+ * before issuing any other async request on the same ctx.
+ *
+ * Keccak-mode contexts (sha->flags & WC_HASH_SHA3_KECCAK256) are rejected
+ * with WH_ERROR_BADARGS: the server applies the standard SHA-3 0x06
+ * padding and has no Keccak fallback. Use the cryptocb path, which routes
+ * Keccak to software.
+ */
+
+#ifndef WOLFSSL_NOSHA3_224
+/* SHA3-224 */
+int wh_Client_Sha3_224(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                       uint32_t inLen, uint8_t* out);
+int wh_Client_Sha3_224UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                    const uint8_t* in, uint32_t inLen,
+                                    bool* requestSent);
+int wh_Client_Sha3_224UpdateResponse(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_224FinalRequest(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_224FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                    uint8_t* out);
+#ifdef WOLFHSM_CFG_DMA
+int wh_Client_Sha3_224Dma(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                          uint32_t inLen, uint8_t* out);
+int wh_Client_Sha3_224DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                       const uint8_t* in, uint32_t inLen,
+                                       bool* requestSent);
+int wh_Client_Sha3_224DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_224DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_224DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                       uint8_t* out);
+#endif /* WOLFHSM_CFG_DMA */
+#endif /* !WOLFSSL_NOSHA3_224 */
+
+#ifndef WOLFSSL_NOSHA3_256
+/* SHA3-256 */
+int wh_Client_Sha3_256(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                       uint32_t inLen, uint8_t* out);
+int wh_Client_Sha3_256UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                    const uint8_t* in, uint32_t inLen,
+                                    bool* requestSent);
+int wh_Client_Sha3_256UpdateResponse(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_256FinalRequest(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_256FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                    uint8_t* out);
+#ifdef WOLFHSM_CFG_DMA
+int wh_Client_Sha3_256Dma(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                          uint32_t inLen, uint8_t* out);
+int wh_Client_Sha3_256DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                       const uint8_t* in, uint32_t inLen,
+                                       bool* requestSent);
+int wh_Client_Sha3_256DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_256DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_256DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                       uint8_t* out);
+#endif /* WOLFHSM_CFG_DMA */
+#endif /* !WOLFSSL_NOSHA3_256 */
+
+#ifndef WOLFSSL_NOSHA3_384
+/* SHA3-384 */
+int wh_Client_Sha3_384(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                       uint32_t inLen, uint8_t* out);
+int wh_Client_Sha3_384UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                    const uint8_t* in, uint32_t inLen,
+                                    bool* requestSent);
+int wh_Client_Sha3_384UpdateResponse(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_384FinalRequest(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_384FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                    uint8_t* out);
+#ifdef WOLFHSM_CFG_DMA
+int wh_Client_Sha3_384Dma(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                          uint32_t inLen, uint8_t* out);
+int wh_Client_Sha3_384DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                       const uint8_t* in, uint32_t inLen,
+                                       bool* requestSent);
+int wh_Client_Sha3_384DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_384DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_384DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                       uint8_t* out);
+#endif /* WOLFHSM_CFG_DMA */
+#endif /* !WOLFSSL_NOSHA3_384 */
+
+#ifndef WOLFSSL_NOSHA3_512
+/* SHA3-512 */
+int wh_Client_Sha3_512(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                       uint32_t inLen, uint8_t* out);
+int wh_Client_Sha3_512UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                    const uint8_t* in, uint32_t inLen,
+                                    bool* requestSent);
+int wh_Client_Sha3_512UpdateResponse(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_512FinalRequest(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_512FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                    uint8_t* out);
+#ifdef WOLFHSM_CFG_DMA
+int wh_Client_Sha3_512Dma(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                          uint32_t inLen, uint8_t* out);
+int wh_Client_Sha3_512DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                       const uint8_t* in, uint32_t inLen,
+                                       bool* requestSent);
+int wh_Client_Sha3_512DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_512DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha);
+int wh_Client_Sha3_512DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                       uint8_t* out);
+#endif /* WOLFHSM_CFG_DMA */
+#endif /* !WOLFSSL_NOSHA3_512 */
+
+#endif /* WOLFSSL_SHA3 */
+
 #ifdef WOLFSSL_HAVE_MLDSA
 
 /**
@@ -3207,6 +3335,281 @@ int wh_Client_MlKemDecapsulateDma(whClientContext* ctx, MlKemKey* key,
 #endif /* WOLFHSM_CFG_DMA */
 
 #endif /* WOLFSSL_HAVE_MLKEM */
+
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+#ifdef WOLFHSM_CFG_DMA
+
+/* The raw public key is returned via DMA at keygen time (see the MakeKey
+ * functions below). To retrieve it again later from just a keyId, use the
+ * generic wh_Client_KeyExportPublic(ctx, keyId, WH_KEY_ALGO_LMS or
+ * WH_KEY_ALGO_XMSS, ...). The private state is non-exportable and cannot be
+ * read back by any path. */
+
+#ifdef WOLFSSL_HAVE_LMS
+
+/**
+ * @brief Bind a wolfHSM keyId into an LmsKey's devCtx.
+ *
+ * @param[in] key   LmsKey to update.
+ * @param[in] keyId Server-side keyId to store in key->devCtx.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_LmsSetKeyId(LmsKey* key, whKeyId keyId);
+
+/**
+ * @brief Read the wolfHSM keyId stored in an LmsKey's devCtx.
+ *
+ * @param[in]  key   LmsKey to query.
+ * @param[out] outId Receives the keyId held in key->devCtx.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_LmsGetKeyId(LmsKey* key, whKeyId* outId);
+
+/**
+ * @brief Generate an LMS key on the server.
+ *
+ * The key's parameter set (levels/height/winternitz) must be bound on the
+ * in-memory key before this call (e.g. via wc_LmsKey_SetParameters). On
+ * success the key's devCtx carries the server-side keyId and the public key is
+ * returned via DMA. The key is always committed to the keystore before the
+ * public key is returned: WH_NVM_FLAGS_EPHEMERAL is rejected with
+ * WH_ERROR_BADARGS for stateful keys, since releasing the public key of a
+ * non-durable private key would orphan it on power loss.
+ *
+ * @param[in]     ctx          Pointer to the client context.
+ * @param[in,out] key          LmsKey with its parameter set bound; on success
+ *                             its devCtx carries the keyId.
+ * @param[in,out] inout_key_id On entry an optional requested keyId; on success
+ *                             the assigned keyId. May be NULL.
+ * @param[in]     flags        NVM flags; WH_NVM_FLAGS_EPHEMERAL is rejected.
+ * @param[in]     label_len    Length of label in bytes (0 if none).
+ * @param[in]     label        Optional label, or NULL.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_LmsMakeKeyDma(whClientContext* ctx, LmsKey* key,
+                            whKeyId* inout_key_id, whNvmFlags flags,
+                            uint16_t label_len, uint8_t* label);
+
+/**
+ * @brief Convenience wrapper for keygen that returns the public key via DMA.
+ *
+ * Equivalent to wh_Client_LmsMakeKeyDma with a server-assigned keyId. As with
+ * that call the key is committed to the keystore before its public key is
+ * returned.
+ *
+ * @param[in]     ctx Pointer to the client context.
+ * @param[in,out] key LmsKey with its parameter set bound.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_LmsMakeExportKeyDma(whClientContext* ctx, LmsKey* key);
+
+/**
+ * @brief Sign a message with an HSM-resident LMS key.
+ *
+ * The keyId is taken from key->devCtx. The new private state is committed
+ * atomically to NVM by the server before the signature is returned.
+ *
+ * @param[in]     ctx   Pointer to the client context.
+ * @param[in]     msg   Message to sign.
+ * @param[in]     msgSz Length of msg in bytes.
+ * @param[out]    sig   Buffer to receive the signature.
+ * @param[in,out] sigSz On entry the capacity of sig; on success the signature
+ *                      length.
+ * @param[in]     key   LmsKey whose devCtx carries the keyId.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_LmsSignDma(whClientContext* ctx, const byte* msg, word32 msgSz,
+                         byte* sig, word32* sigSz, LmsKey* key);
+
+/**
+ * @brief Verify a signature using an HSM-resident LMS key.
+ *
+ * @param[in]  ctx   Pointer to the client context.
+ * @param[in]  sig   Signature to verify.
+ * @param[in]  sigSz Length of sig in bytes.
+ * @param[in]  msg   Message that was signed.
+ * @param[in]  msgSz Length of msg in bytes.
+ * @param[out] res   Set to 1 on a valid signature, 0 on mismatch.
+ * @param[in]  key   LmsKey whose devCtx carries the keyId.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_LmsVerifyDma(whClientContext* ctx, const byte* sig, word32 sigSz,
+                           const byte* msg, word32 msgSz, int* res,
+                           LmsKey* key);
+
+/**
+ * @brief Report whether an HSM-resident LMS key can still produce signatures.
+ *
+ * Mirrors wc_LmsKey_SigsLeft(): the result is a boolean, not a count.
+ *
+ * @param[in]  ctx Pointer to the client context.
+ * @param[in]  key LmsKey whose devCtx carries the keyId.
+ * @return int Returns 1 if signatures remain, 0 if the key is exhausted, or a
+ *             negative error code on failure.
+ */
+int wh_Client_LmsSigsLeftDma(whClientContext* ctx, LmsKey* key);
+
+/**
+ * @brief Import a verify-only LMS public key into the keystore.
+ *
+ * The in-memory key must have its parameter set bound and the public key
+ * loaded (e.g. via wc_LmsKey_SetParameters + wc_LmsKey_ImportPubRaw). On
+ * success the key's devCtx carries the server-side keyId, usable with
+ * wh_Client_LmsVerifyDma. No private state is stored, so the key cannot sign.
+ *
+ * @param[in]     ctx         Pointer to the client context.
+ * @param[in,out] key         LmsKey with its parameter set bound and public
+ *                            key loaded; on success its devCtx carries the
+ *                            keyId.
+ * @param[in,out] inout_keyId On entry a specific keyId to provision, or
+ *                            WH_KEYID_ERASED to be assigned one; on success the
+ *                            keyId. May be NULL.
+ * @param[in]     flags       NVM flags; WH_NVM_FLAGS_NONMODIFIABLE pins the
+ *                            key, and it is committed to NVM unless
+ *                            WH_NVM_FLAGS_EPHEMERAL is set.
+ * @param[in]     label_len   Length of label in bytes (0 if none).
+ * @param[in]     label       Optional label, or NULL.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_LmsImportPubKey(whClientContext* ctx, LmsKey* key,
+                              whKeyId* inout_keyId, whNvmFlags flags,
+                              uint16_t label_len, uint8_t* label);
+
+#endif /* WOLFSSL_HAVE_LMS */
+
+#ifdef WOLFSSL_HAVE_XMSS
+
+/**
+ * @brief Bind a wolfHSM keyId into an XmssKey's devCtx.
+ *
+ * @param[in] key   XmssKey to update.
+ * @param[in] keyId Server-side keyId to store in key->devCtx.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_XmssSetKeyId(XmssKey* key, whKeyId keyId);
+
+/**
+ * @brief Read the wolfHSM keyId stored in an XmssKey's devCtx.
+ *
+ * @param[in]  key   XmssKey to query.
+ * @param[out] outId Receives the keyId held in key->devCtx.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_XmssGetKeyId(XmssKey* key, whKeyId* outId);
+
+/**
+ * @brief Generate an XMSS / XMSS^MT key on the server.
+ *
+ * The parameter string must be bound on the in-memory key (via
+ * wc_XmssKey_SetParamStr) before this call. On success the key's devCtx
+ * carries the server-side keyId and the public key is returned via DMA. The
+ * key is always committed to the keystore before the public key is returned:
+ * WH_NVM_FLAGS_EPHEMERAL is rejected with WH_ERROR_BADARGS for stateful keys,
+ * since releasing the public key of a non-durable private key would orphan it
+ * on power loss.
+ *
+ * @param[in]     ctx          Pointer to the client context.
+ * @param[in,out] key          XmssKey with its parameter string bound; on
+ *                             success its devCtx carries the keyId.
+ * @param[in,out] inout_key_id On entry an optional requested keyId; on success
+ *                             the assigned keyId. May be NULL.
+ * @param[in]     flags        NVM flags; WH_NVM_FLAGS_EPHEMERAL is rejected.
+ * @param[in]     label_len    Length of label in bytes (0 if none).
+ * @param[in]     label        Optional label, or NULL.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_XmssMakeKeyDma(whClientContext* ctx, XmssKey* key,
+                             whKeyId* inout_key_id, whNvmFlags flags,
+                             uint16_t label_len, uint8_t* label);
+
+/**
+ * @brief Convenience wrapper for keygen that returns the public key via DMA.
+ *
+ * Equivalent to wh_Client_XmssMakeKeyDma with a server-assigned keyId. As with
+ * that call the key is committed to the keystore before its public key is
+ * returned.
+ *
+ * @param[in]     ctx Pointer to the client context.
+ * @param[in,out] key XmssKey with its parameter string bound.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_XmssMakeExportKeyDma(whClientContext* ctx, XmssKey* key);
+
+/**
+ * @brief Sign a message with an HSM-resident XMSS key.
+ *
+ * The keyId is taken from key->devCtx. The new private state is committed
+ * atomically to NVM by the server before the signature is returned.
+ *
+ * @param[in]     ctx   Pointer to the client context.
+ * @param[in]     msg   Message to sign.
+ * @param[in]     msgSz Length of msg in bytes.
+ * @param[out]    sig   Buffer to receive the signature.
+ * @param[in,out] sigSz On entry the capacity of sig; on success the signature
+ *                      length.
+ * @param[in]     key   XmssKey whose devCtx carries the keyId.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_XmssSignDma(whClientContext* ctx, const byte* msg, word32 msgSz,
+                          byte* sig, word32* sigSz, XmssKey* key);
+
+/**
+ * @brief Verify a signature using an HSM-resident XMSS key.
+ *
+ * @param[in]  ctx   Pointer to the client context.
+ * @param[in]  sig   Signature to verify.
+ * @param[in]  sigSz Length of sig in bytes.
+ * @param[in]  msg   Message that was signed.
+ * @param[in]  msgSz Length of msg in bytes.
+ * @param[out] res   Set to 1 on a valid signature, 0 on mismatch.
+ * @param[in]  key   XmssKey whose devCtx carries the keyId.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_XmssVerifyDma(whClientContext* ctx, const byte* sig,
+                            word32 sigSz, const byte* msg, word32 msgSz,
+                            int* res, XmssKey* key);
+
+/**
+ * @brief Report whether an HSM-resident XMSS key can still produce signatures.
+ *
+ * Mirrors wc_XmssKey_SigsLeft(): the result is a boolean, not a count.
+ *
+ * @param[in]  ctx Pointer to the client context.
+ * @param[in]  key XmssKey whose devCtx carries the keyId.
+ * @return int Returns 1 if signatures remain, 0 if the key is exhausted, or a
+ *             negative error code on failure.
+ */
+int wh_Client_XmssSigsLeftDma(whClientContext* ctx, XmssKey* key);
+
+/**
+ * @brief Import a verify-only XMSS / XMSS^MT public key into the keystore.
+ *
+ * The in-memory key must have its parameter string bound and the public key
+ * loaded (e.g. via wc_XmssKey_SetParamStr + wc_XmssKey_ImportPubRaw). Semantics
+ * match wh_Client_LmsImportPubKey: no private state is stored (verify only) so
+ * the key cannot sign, it may be pinned with WH_NVM_FLAGS_NONMODIFIABLE, and it
+ * is committed to NVM unless flags include WH_NVM_FLAGS_EPHEMERAL.
+ *
+ * @param[in]     ctx         Pointer to the client context.
+ * @param[in,out] key         XmssKey with its parameter string bound and
+ *                            public key loaded; on success its devCtx carries
+ *                            the keyId.
+ * @param[in,out] inout_keyId On entry a specific keyId to provision, or
+ *                            WH_KEYID_ERASED to be assigned one; on success the
+ *                            keyId. May be NULL.
+ * @param[in]     flags       NVM flags (see wh_Client_LmsImportPubKey).
+ * @param[in]     label_len   Length of label in bytes (0 if none).
+ * @param[in]     label       Optional label, or NULL.
+ * @return int Returns 0 on success or a negative error code on failure.
+ */
+int wh_Client_XmssImportPubKey(whClientContext* ctx, XmssKey* key,
+                               whKeyId* inout_keyId, whNvmFlags flags,
+                               uint16_t label_len, uint8_t* label);
+
+#endif /* WOLFSSL_HAVE_XMSS */
+
+#endif /* WOLFHSM_CFG_DMA */
+#endif /* WOLFSSL_HAVE_LMS || WOLFSSL_HAVE_XMSS */
 
 #endif /* !WOLFHSM_CFG_NO_CRYPTO */
 #endif /* !WOLFHSM_WH_CLIENT_CRYPTO_H_ */

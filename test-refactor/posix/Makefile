@@ -100,6 +100,16 @@ ifeq ($(DMA),1)
     DEF += -DWOLFHSM_CFG_DMA
 endif
 
+# Build LMS/XMSS in verify-only mode (omits private-key, sign, and keygen
+# paths). May be combined to exercise the mixed (one verify-only) case.
+ifeq ($(LMS_VERIFY_ONLY),1)
+    DEF += -DWOLFSSL_LMS_VERIFY_ONLY
+endif
+
+ifeq ($(XMSS_VERIFY_ONLY),1)
+    DEF += -DWOLFSSL_XMSS_VERIFY_ONLY
+endif
+
 # Support a SHE-capable build
 ifeq ($(SHE),1)
     DEF += -DWOLFHSM_CFG_SHE_EXTENSION
@@ -152,6 +162,9 @@ ifeq ($(TESTWOLFCRYPT),1)
 
     TESTWOLFCRYPT_DEVID ?= $(TESTWOLFCRYPT_DEFAULT_DEVID)
 
+    # The wolfCrypt test suite drives the HSM through the always-registered
+    # global devIds (TESTWOLFCRYPT_DEVID defaults to WH_DEV_ID;
+    # TESTWOLFCRYPT_DMA uses WH_DEV_ID_DMA).
     DEF += -DWC_USE_DEVID=$(TESTWOLFCRYPT_DEVID)
 
     # wolfCrypt test source files
@@ -181,6 +194,11 @@ SRC_C += $(wildcard $(PROJECT_DIR)/*.c)
 # self-gated on WOLFHSM_CFG_THREADSAFE et al. so it compiles to
 # an empty TU when the gate isn't satisfied.
 SRC_C += $(TEST_DIR)/wh_test_posix_threadsafe_stress.c
+
+# Shared NVM backend selector pulled from test/; provides
+# whTest_NvmCfgBackend for tests that exercise multiple NVM
+# backends (flash and flash-log).
+SRC_C += $(TEST_DIR)/wh_test_common.c
 
 
 ## Build rules

@@ -56,6 +56,12 @@
 #include "wolfssl/wolfcrypt/ed25519.h"
 #include "wolfssl/wolfcrypt/wc_mldsa.h"
 #include "wolfssl/wolfcrypt/wc_mlkem.h"
+#if defined(WOLFSSL_HAVE_LMS)
+#include "wolfssl/wolfcrypt/wc_lms.h"
+#endif
+#if defined(WOLFSSL_HAVE_XMSS)
+#include "wolfssl/wolfcrypt/wc_xmss.h"
+#endif
 #include "wolfssl/wolfcrypt/sha256.h"
 #include "wolfssl/wolfcrypt/sha512.h"
 #endif
@@ -8410,6 +8416,882 @@ int wh_Client_Sha512Dma(whClientContext* ctx, wc_Sha512* sha, const uint8_t* in,
 #endif /* WOLFHSM_CFG_DMA  */
 #endif /* WOLFSSL_SHA512 */
 
+#if defined(WOLFSSL_SHA3)
+/* SHA3 - all four variants (224/256/384/512) share the wc_Sha3 struct and
+ * the same wire format. Per-variant differences (block size, digest size,
+ * Update/Final functions) are passed via a small dispatch table. */
+
+typedef struct {
+    int      hashType; /* WC_HASH_TYPE_SHA3_* (also algoType on the wire) */
+    uint32_t blockSize;
+    uint32_t digestSize;
+    uint32_t maxInlineSz;
+    /* Only initFn is used client-side (context reset after Final). Update/Final
+     * run on the server, so no update/final pointers are carried here. */
+    int (*initFn)(wc_Sha3* sha, void* heap, int devId);
+} whSha3Variant;
+
+#ifndef WOLFSSL_NOSHA3_224
+static const whSha3Variant whSha3_224 = {
+    WC_HASH_TYPE_SHA3_224, WC_SHA3_224_BLOCK_SIZE, WC_SHA3_224_DIGEST_SIZE,
+    WH_MESSAGE_CRYPTO_SHA3_224_MAX_INLINE_UPDATE_SZ, wc_InitSha3_224};
+#endif
+#ifndef WOLFSSL_NOSHA3_256
+static const whSha3Variant whSha3_256 = {
+    WC_HASH_TYPE_SHA3_256, WC_SHA3_256_BLOCK_SIZE, WC_SHA3_256_DIGEST_SIZE,
+    WH_MESSAGE_CRYPTO_SHA3_256_MAX_INLINE_UPDATE_SZ, wc_InitSha3_256};
+#endif
+#ifndef WOLFSSL_NOSHA3_384
+static const whSha3Variant whSha3_384 = {
+    WC_HASH_TYPE_SHA3_384, WC_SHA3_384_BLOCK_SIZE, WC_SHA3_384_DIGEST_SIZE,
+    WH_MESSAGE_CRYPTO_SHA3_384_MAX_INLINE_UPDATE_SZ, wc_InitSha3_384};
+#endif
+#ifndef WOLFSSL_NOSHA3_512
+static const whSha3Variant whSha3_512 = {
+    WC_HASH_TYPE_SHA3_512, WC_SHA3_512_BLOCK_SIZE, WC_SHA3_512_DIGEST_SIZE,
+    WH_MESSAGE_CRYPTO_SHA3_512_MAX_INLINE_UPDATE_SZ, wc_InitSha3_512};
+#endif
+
+/* Maximum input absorbable by a single UpdateRequest: inline wire capacity
+ * plus room left in the local partial-block buffer. */
+static uint32_t _Sha3UpdatePerCallCapacity(const wc_Sha3*       sha,
+                                           const whSha3Variant* v)
+{
+    return v->maxInlineSz + (uint32_t)(v->blockSize - 1u - sha->i);
+}
+
+/* Reject Keccak-mode contexts. The wire format carries only s[] and the
+ * server re-inits the context, applying standard SHA-3 0x06 padding; a
+ * Keccak-flagged context would silently produce a wrong digest. The cryptocb
+ * path falls back to software for this case; the direct API has no fallback
+ * so it must refuse the call. */
+static int _Sha3RejectKeccak(const wc_Sha3* sha)
+{
+#ifdef WOLFSSL_HASH_FLAGS
+    if (sha != NULL && (sha->flags & WC_HASH_SHA3_KECCAK256) != 0u) {
+        return WH_ERROR_BADARGS;
+    }
+#else
+    (void)sha;
+#endif
+    return WH_ERROR_OK;
+}
+
+static int _Sha3UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                              const whSha3Variant* v, const uint8_t* in,
+                              uint32_t inLen, bool* requestSent)
+{
+    int                          ret = 0;
+    whMessageCrypto_Sha3Request* req = NULL;
+    uint8_t*                     inlineData;
+    uint8_t*                     dataPtr = NULL;
+    uint32_t                     capacity;
+    uint32_t                     wirePos = 0;
+    uint32_t                     i       = 0;
+    /* Snapshot of partial buffer for rollback if SendRequest fails */
+    uint32_t savedI;
+    uint8_t  savedT[WC_SHA3_224_BLOCK_SIZE]; /* largest block size: 144 */
+
+    if (ctx == NULL || sha == NULL || requestSent == NULL ||
+        (in == NULL && inLen != 0)) {
+        return WH_ERROR_BADARGS;
+    }
+    *requestSent = false;
+
+    ret = _Sha3RejectKeccak(sha);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+
+    if (sha->i >= v->blockSize) {
+        return WH_ERROR_BADARGS;
+    }
+
+    capacity = _Sha3UpdatePerCallCapacity(sha, v);
+    if (inLen > capacity) {
+        return WH_ERROR_BADARGS;
+    }
+    if (inLen == 0) {
+        return WH_ERROR_OK;
+    }
+
+    dataPtr = wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_Sha3Request*)_createCryptoRequest(
+        dataPtr, v->hashType, ctx->cryptoAffinity);
+    inlineData = (uint8_t*)(req + 1);
+
+    savedI = sha->i;
+    memcpy(savedT, sha->t, sha->i);
+
+    /* Top up the local partial buffer. If it completes a full block, copy
+     * the assembled block as the first inline block. */
+    if (sha->i > 0) {
+        while (i < inLen && sha->i < v->blockSize) {
+            sha->t[sha->i++] = in[i++];
+        }
+        if (sha->i == v->blockSize) {
+            memcpy(inlineData + wirePos, sha->t, v->blockSize);
+            wirePos += v->blockSize;
+            sha->i = 0;
+        }
+    }
+
+    /* Pack as many whole input blocks as will fit inline. */
+    while ((inLen - i) >= v->blockSize &&
+           (wirePos + v->blockSize) <= v->maxInlineSz) {
+        memcpy(inlineData + wirePos, in + i, v->blockSize);
+        wirePos += v->blockSize;
+        i += v->blockSize;
+    }
+
+    /* Stash remaining tail bytes locally. */
+    while (i < inLen) {
+        sha->t[sha->i++] = in[i++];
+    }
+
+    /* Pure buffer-fill update: nothing to send. */
+    if (wirePos == 0) {
+        return WH_ERROR_OK;
+    }
+
+    req->isLastBlock = 0;
+    req->inSz        = wirePos;
+    memcpy(req->resumeState.s, sha->s, sizeof(req->resumeState.s));
+
+    ret = wh_Client_SendRequest(ctx, WH_MESSAGE_GROUP_CRYPTO, WC_ALGO_TYPE_HASH,
+                                sizeof(whMessageCrypto_GenericRequestHeader) +
+                                    sizeof(*req) + wirePos,
+                                dataPtr);
+    if (ret == 0) {
+        *requestSent = true;
+    }
+    else {
+        /* Restore partial buffer on failure so caller can retry. */
+        sha->i = savedI;
+        memcpy(sha->t, savedT, savedI);
+    }
+    return ret;
+}
+
+static int _Sha3UpdateResponse(whClientContext* ctx, wc_Sha3* sha,
+                               const whSha3Variant* v)
+{
+    uint16_t                      group  = WH_MESSAGE_GROUP_CRYPTO;
+    uint16_t                      action = WH_MESSAGE_ACTION_NONE;
+    uint16_t                      dataSz = 0;
+    int                           ret    = 0;
+    whMessageCrypto_Sha3Response* res    = NULL;
+    uint8_t*                      dataPtr;
+
+    if (ctx == NULL || sha == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    ret = wh_Client_RecvResponse(ctx, &group, &action, &dataSz, dataPtr);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+
+    ret = _getCryptoResponse(dataPtr, v->hashType, (uint8_t**)&res);
+    if (ret >= 0) {
+        if (dataSz <
+            sizeof(whMessageCrypto_GenericResponseHeader) + sizeof(*res)) {
+            return WH_ERROR_ABORTED;
+        }
+        memcpy(sha->s, res->resumeState.s, sizeof(sha->s));
+    }
+    return ret;
+}
+
+static int _Sha3FinalRequest(whClientContext* ctx, wc_Sha3* sha,
+                             const whSha3Variant* v)
+{
+    int                          ret;
+    whMessageCrypto_Sha3Request* req;
+    uint8_t*                     inlineData;
+    uint8_t*                     dataPtr;
+
+    if (ctx == NULL || sha == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+    ret = _Sha3RejectKeccak(sha);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+    if (sha->i >= v->blockSize) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_Sha3Request*)_createCryptoRequest(
+        dataPtr, v->hashType, ctx->cryptoAffinity);
+    inlineData = (uint8_t*)(req + 1);
+
+    req->isLastBlock = 1;
+    req->inSz        = sha->i;
+    memcpy(req->resumeState.s, sha->s, sizeof(req->resumeState.s));
+    if (sha->i > 0) {
+        memcpy(inlineData, sha->t, sha->i);
+    }
+
+    ret = wh_Client_SendRequest(ctx, WH_MESSAGE_GROUP_CRYPTO, WC_ALGO_TYPE_HASH,
+                                sizeof(whMessageCrypto_GenericRequestHeader) +
+                                    sizeof(*req) + sha->i,
+                                dataPtr);
+    return ret;
+}
+
+static int _Sha3FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                              const whSha3Variant* v, uint8_t* out)
+{
+    uint16_t                      group  = WH_MESSAGE_GROUP_CRYPTO;
+    uint16_t                      action = WH_MESSAGE_ACTION_NONE;
+    uint16_t                      dataSz = 0;
+    int                           ret;
+    whMessageCrypto_Sha3Response* res = NULL;
+    uint8_t*                      dataPtr;
+    void*                         savedHeap;
+    int                           savedDevId;
+
+    if (ctx == NULL || sha == NULL || out == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    ret = wh_Client_RecvResponse(ctx, &group, &action, &dataSz, dataPtr);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = _getCryptoResponse(dataPtr, v->hashType, (uint8_t**)&res);
+    if (ret >= 0) {
+        if (dataSz <
+            sizeof(whMessageCrypto_GenericResponseHeader) + sizeof(*res)) {
+            return WH_ERROR_ABORTED;
+        }
+        memcpy(out, res->hash, v->digestSize);
+        /* Reset state, preserving heap and devId. */
+        savedHeap  = sha->heap;
+        savedDevId = sha->devId;
+        (void)v->initFn(sha, savedHeap, savedDevId);
+    }
+    return ret;
+}
+
+static int _Sha3Oneshot(whClientContext* ctx, wc_Sha3* sha,
+                        const whSha3Variant* v, const uint8_t* in,
+                        uint32_t inLen, uint8_t* out)
+{
+    int ret = WH_ERROR_OK;
+
+    /* _Sha3UpdatePerCallCapacity (below) reads sha->i, so validate sha here
+     * rather than relying on the lower-level helper's NULL check. */
+    if (ctx == NULL || sha == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Mirror _Sha3UpdateRequest's invariant: skipping the update branch on
+     * (in == NULL && inLen != 0) would silently digest the current state. */
+    if (in == NULL && inLen != 0) {
+        return WH_ERROR_BADARGS;
+    }
+
+    if (in != NULL && inLen > 0) {
+        uint32_t consumed = 0;
+        while (ret == WH_ERROR_OK && consumed < inLen) {
+            uint32_t capacity  = _Sha3UpdatePerCallCapacity(sha, v);
+            uint32_t remaining = inLen - consumed;
+            uint32_t chunk     = (remaining < capacity) ? remaining : capacity;
+            bool     sent      = false;
+
+            ret = _Sha3UpdateRequest(ctx, sha, v, in + consumed, chunk, &sent);
+            if (ret != WH_ERROR_OK) {
+                break;
+            }
+            if (sent) {
+                do {
+                    ret = _Sha3UpdateResponse(ctx, sha, v);
+                } while (ret == WH_ERROR_NOTREADY);
+                if (ret != WH_ERROR_OK) {
+                    break;
+                }
+            }
+            consumed += chunk;
+        }
+    }
+
+    if (ret == WH_ERROR_OK && out != NULL) {
+        ret = _Sha3FinalRequest(ctx, sha, v);
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = _Sha3FinalResponse(ctx, sha, v, out);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+    }
+    return ret;
+}
+
+/* Per-variant public APIs - thin wrappers over the shared helpers. */
+
+#ifndef WOLFSSL_NOSHA3_224
+int wh_Client_Sha3_224(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                       uint32_t inLen, uint8_t* out)
+{
+    return _Sha3Oneshot(ctx, sha, &whSha3_224, in, inLen, out);
+}
+
+int wh_Client_Sha3_224UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                    const uint8_t* in, uint32_t inLen,
+                                    bool* requestSent)
+{
+    return _Sha3UpdateRequest(ctx, sha, &whSha3_224, in, inLen, requestSent);
+}
+
+int wh_Client_Sha3_224UpdateResponse(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3UpdateResponse(ctx, sha, &whSha3_224);
+}
+
+int wh_Client_Sha3_224FinalRequest(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3FinalRequest(ctx, sha, &whSha3_224);
+}
+
+int wh_Client_Sha3_224FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                    uint8_t* out)
+{
+    return _Sha3FinalResponse(ctx, sha, &whSha3_224, out);
+}
+#endif /* !WOLFSSL_NOSHA3_224 */
+
+#ifndef WOLFSSL_NOSHA3_256
+int wh_Client_Sha3_256(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                       uint32_t inLen, uint8_t* out)
+{
+    return _Sha3Oneshot(ctx, sha, &whSha3_256, in, inLen, out);
+}
+
+int wh_Client_Sha3_256UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                    const uint8_t* in, uint32_t inLen,
+                                    bool* requestSent)
+{
+    return _Sha3UpdateRequest(ctx, sha, &whSha3_256, in, inLen, requestSent);
+}
+
+int wh_Client_Sha3_256UpdateResponse(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3UpdateResponse(ctx, sha, &whSha3_256);
+}
+
+int wh_Client_Sha3_256FinalRequest(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3FinalRequest(ctx, sha, &whSha3_256);
+}
+
+int wh_Client_Sha3_256FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                    uint8_t* out)
+{
+    return _Sha3FinalResponse(ctx, sha, &whSha3_256, out);
+}
+#endif /* !WOLFSSL_NOSHA3_256 */
+
+#ifndef WOLFSSL_NOSHA3_384
+int wh_Client_Sha3_384(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                       uint32_t inLen, uint8_t* out)
+{
+    return _Sha3Oneshot(ctx, sha, &whSha3_384, in, inLen, out);
+}
+
+int wh_Client_Sha3_384UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                    const uint8_t* in, uint32_t inLen,
+                                    bool* requestSent)
+{
+    return _Sha3UpdateRequest(ctx, sha, &whSha3_384, in, inLen, requestSent);
+}
+
+int wh_Client_Sha3_384UpdateResponse(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3UpdateResponse(ctx, sha, &whSha3_384);
+}
+
+int wh_Client_Sha3_384FinalRequest(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3FinalRequest(ctx, sha, &whSha3_384);
+}
+
+int wh_Client_Sha3_384FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                    uint8_t* out)
+{
+    return _Sha3FinalResponse(ctx, sha, &whSha3_384, out);
+}
+#endif /* !WOLFSSL_NOSHA3_384 */
+
+#ifndef WOLFSSL_NOSHA3_512
+int wh_Client_Sha3_512(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                       uint32_t inLen, uint8_t* out)
+{
+    return _Sha3Oneshot(ctx, sha, &whSha3_512, in, inLen, out);
+}
+
+int wh_Client_Sha3_512UpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                    const uint8_t* in, uint32_t inLen,
+                                    bool* requestSent)
+{
+    return _Sha3UpdateRequest(ctx, sha, &whSha3_512, in, inLen, requestSent);
+}
+
+int wh_Client_Sha3_512UpdateResponse(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3UpdateResponse(ctx, sha, &whSha3_512);
+}
+
+int wh_Client_Sha3_512FinalRequest(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3FinalRequest(ctx, sha, &whSha3_512);
+}
+
+int wh_Client_Sha3_512FinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                    uint8_t* out)
+{
+    return _Sha3FinalResponse(ctx, sha, &whSha3_512, out);
+}
+#endif /* !WOLFSSL_NOSHA3_512 */
+
+#ifdef WOLFHSM_CFG_DMA
+/* SHA3 DMA helpers - inline first block (assembled from partial buffer) plus
+ * whole-block DMA input. Final goes inline-only. */
+
+static int _Sha3DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                 const whSha3Variant* v, const uint8_t* in,
+                                 uint32_t inLen, bool* requestSent)
+{
+    int                             ret     = WH_ERROR_OK;
+    uint8_t*                        dataPtr = NULL;
+    whMessageCrypto_Sha3DmaRequest* req     = NULL;
+    uint8_t*                        inlineData;
+    uint32_t                        wirePos        = 0;
+    uint32_t                        i              = 0;
+    uintptr_t                       inAddr         = 0;
+    bool                            inAddrAcquired = false;
+    const uint8_t*                  dmaBase        = NULL;
+    uint32_t                        dmaSz          = 0;
+    uint32_t                        savedI;
+    uint8_t                         savedT[WC_SHA3_224_BLOCK_SIZE];
+
+    if (ctx == NULL || sha == NULL || requestSent == NULL ||
+        (in == NULL && inLen != 0)) {
+        return WH_ERROR_BADARGS;
+    }
+    *requestSent = false;
+
+    ret = _Sha3RejectKeccak(sha);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+    if (wh_CommClient_IsRequestPending(ctx->comm) == 1) {
+        return WH_ERROR_REQUEST_PENDING;
+    }
+
+    if (sha->i >= v->blockSize) {
+        return WH_ERROR_BADARGS;
+    }
+    if (inLen == 0) {
+        return WH_ERROR_OK;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_Sha3DmaRequest*)_createCryptoRequest(
+        dataPtr, v->hashType, ctx->cryptoAffinity);
+    inlineData = (uint8_t*)(req + 1);
+
+    savedI = sha->i;
+    memcpy(savedT, sha->t, sha->i);
+
+    if (sha->i > 0) {
+        while (i < inLen && sha->i < v->blockSize) {
+            sha->t[sha->i++] = in[i++];
+        }
+        if (sha->i == v->blockSize) {
+            memcpy(inlineData, sha->t, v->blockSize);
+            wirePos = v->blockSize;
+            sha->i  = 0;
+        }
+    }
+
+    if ((inLen - i) >= v->blockSize) {
+        dmaBase = in + i;
+        dmaSz   = ((inLen - i) / v->blockSize) * v->blockSize;
+        i += dmaSz;
+    }
+
+    while (i < inLen) {
+        sha->t[sha->i++] = in[i++];
+    }
+
+    if (wirePos == 0 && dmaSz == 0) {
+        return WH_ERROR_OK;
+    }
+
+    req->isLastBlock = 0;
+    req->inSz        = wirePos;
+    memcpy(req->resumeState.s, sha->s, sizeof(req->resumeState.s));
+    req->input.sz   = dmaSz;
+    req->input.addr = 0;
+
+    if (dmaSz > 0) {
+        ret = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)dmaBase, (void**)&inAddr, dmaSz,
+            WH_DMA_OPER_CLIENT_READ_PRE, (whDmaFlags){0});
+        if (ret == WH_ERROR_OK) {
+            inAddrAcquired  = true;
+            req->input.addr = inAddr;
+        }
+    }
+
+    if (ret == WH_ERROR_OK) {
+        ctx->dma.asyncCtx.sha.ioAddr     = inAddr;
+        ctx->dma.asyncCtx.sha.clientAddr = (uintptr_t)dmaBase;
+        ctx->dma.asyncCtx.sha.ioSz       = dmaSz;
+
+        ret = wh_Client_SendRequest(
+            ctx, WH_MESSAGE_GROUP_CRYPTO_DMA, WC_ALGO_TYPE_HASH,
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req) +
+                wirePos,
+            dataPtr);
+    }
+
+    if (ret == WH_ERROR_OK) {
+        *requestSent = true;
+    }
+    else {
+        sha->i = savedI;
+        memcpy(sha->t, savedT, savedI);
+        if (inAddrAcquired) {
+            (void)wh_Client_DmaProcessClientAddress(
+                ctx, (uintptr_t)dmaBase, (void**)&inAddr, dmaSz,
+                WH_DMA_OPER_CLIENT_READ_POST, (whDmaFlags){0});
+        }
+        memset(&ctx->dma.asyncCtx.sha, 0, sizeof(ctx->dma.asyncCtx.sha));
+    }
+    return ret;
+}
+
+static int _Sha3DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha,
+                                  const whSha3Variant* v)
+{
+    int                              ret     = WH_ERROR_OK;
+    uint8_t*                         dataPtr = NULL;
+    whMessageCrypto_Sha3DmaResponse* resp    = NULL;
+    uint16_t                         respSz  = 0;
+
+    if (ctx == NULL || sha == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    ret = wh_Client_RecvResponse(ctx, NULL, NULL, &respSz, dataPtr);
+    if (ret == WH_ERROR_NOTREADY) {
+        return ret;
+    }
+
+    if (ret == WH_ERROR_OK) {
+        ret = _getCryptoResponse(dataPtr, v->hashType, (uint8_t**)&resp);
+        if (ret >= 0) {
+            if (respSz <
+                sizeof(whMessageCrypto_GenericResponseHeader) + sizeof(*resp)) {
+                ret = WH_ERROR_ABORTED;
+            }
+            else {
+                memcpy(sha->s, resp->resumeState.s, sizeof(sha->s));
+            }
+        }
+    }
+
+    if (ctx->dma.asyncCtx.sha.ioSz > 0) {
+        uintptr_t ioAddr = ctx->dma.asyncCtx.sha.ioAddr;
+        (void)wh_Client_DmaProcessClientAddress(
+            ctx, ctx->dma.asyncCtx.sha.clientAddr, (void**)&ioAddr,
+            ctx->dma.asyncCtx.sha.ioSz, WH_DMA_OPER_CLIENT_READ_POST,
+            (whDmaFlags){0});
+        ctx->dma.asyncCtx.sha.ioSz = 0;
+    }
+    return ret;
+}
+
+static int _Sha3DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha,
+                                const whSha3Variant* v)
+{
+    int                             ret     = WH_ERROR_OK;
+    uint8_t*                        dataPtr = NULL;
+    whMessageCrypto_Sha3DmaRequest* req     = NULL;
+    uint8_t*                        inlineData;
+
+    if (ctx == NULL || sha == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+    ret = _Sha3RejectKeccak(sha);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+    if (wh_CommClient_IsRequestPending(ctx->comm) == 1) {
+        return WH_ERROR_REQUEST_PENDING;
+    }
+    if (sha->i >= v->blockSize) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_Sha3DmaRequest*)_createCryptoRequest(
+        dataPtr, v->hashType, ctx->cryptoAffinity);
+    inlineData = (uint8_t*)(req + 1);
+
+    req->isLastBlock = 1;
+    req->inSz        = sha->i;
+    memcpy(req->resumeState.s, sha->s, sizeof(req->resumeState.s));
+    req->input.sz   = 0;
+    req->input.addr = 0;
+
+    if (sha->i > 0) {
+        memcpy(inlineData, sha->t, sha->i);
+    }
+
+    ret = wh_Client_SendRequest(
+        ctx, WH_MESSAGE_GROUP_CRYPTO_DMA, WC_ALGO_TYPE_HASH,
+        sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req) + sha->i,
+        dataPtr);
+    return ret;
+}
+
+static int _Sha3DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                 const whSha3Variant* v, uint8_t* out)
+{
+    int                              ret     = WH_ERROR_OK;
+    uint8_t*                         dataPtr = NULL;
+    whMessageCrypto_Sha3DmaResponse* resp    = NULL;
+    uint16_t                         respSz  = 0;
+    void*                            savedHeap;
+    int                              savedDevId;
+
+    if (ctx == NULL || sha == NULL || out == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    ret = wh_Client_RecvResponse(ctx, NULL, NULL, &respSz, dataPtr);
+    if (ret == WH_ERROR_NOTREADY) {
+        return ret;
+    }
+
+    if (ret == WH_ERROR_OK) {
+        ret = _getCryptoResponse(dataPtr, v->hashType, (uint8_t**)&resp);
+        if (ret >= 0) {
+            if (respSz <
+                sizeof(whMessageCrypto_GenericResponseHeader) + sizeof(*resp)) {
+                return WH_ERROR_ABORTED;
+            }
+            memcpy(out, resp->hash, v->digestSize);
+            savedHeap  = sha->heap;
+            savedDevId = sha->devId;
+            (void)v->initFn(sha, savedHeap, savedDevId);
+        }
+    }
+    return ret;
+}
+
+static int _Sha3DmaOneshot(whClientContext* ctx, wc_Sha3* sha,
+                           const whSha3Variant* v, const uint8_t* in,
+                           uint32_t inLen, uint8_t* out)
+{
+    int ret = WH_ERROR_OK;
+
+    /* Mirror _Sha3DmaUpdateRequest's invariant: skipping the update branch on
+     * (in == NULL && inLen != 0) would silently digest the current state. */
+    if (in == NULL && inLen != 0) {
+        return WH_ERROR_BADARGS;
+    }
+
+    if (in != NULL && inLen > 0) {
+        bool sent = false;
+        ret       = _Sha3DmaUpdateRequest(ctx, sha, v, in, inLen, &sent);
+        if (ret == WH_ERROR_OK && sent) {
+            do {
+                ret = _Sha3DmaUpdateResponse(ctx, sha, v);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+    }
+    if (ret == WH_ERROR_OK && out != NULL) {
+        ret = _Sha3DmaFinalRequest(ctx, sha, v);
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = _Sha3DmaFinalResponse(ctx, sha, v, out);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+    }
+    return ret;
+}
+
+/* Per-variant DMA public APIs - thin wrappers over the shared DMA helpers. */
+
+#ifndef WOLFSSL_NOSHA3_224
+int wh_Client_Sha3_224Dma(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                          uint32_t inLen, uint8_t* out)
+{
+    return _Sha3DmaOneshot(ctx, sha, &whSha3_224, in, inLen, out);
+}
+
+int wh_Client_Sha3_224DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                       const uint8_t* in, uint32_t inLen,
+                                       bool* requestSent)
+{
+    return _Sha3DmaUpdateRequest(ctx, sha, &whSha3_224, in, inLen, requestSent);
+}
+
+int wh_Client_Sha3_224DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3DmaUpdateResponse(ctx, sha, &whSha3_224);
+}
+
+int wh_Client_Sha3_224DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3DmaFinalRequest(ctx, sha, &whSha3_224);
+}
+
+int wh_Client_Sha3_224DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                       uint8_t* out)
+{
+    return _Sha3DmaFinalResponse(ctx, sha, &whSha3_224, out);
+}
+#endif /* !WOLFSSL_NOSHA3_224 */
+
+#ifndef WOLFSSL_NOSHA3_256
+int wh_Client_Sha3_256Dma(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                          uint32_t inLen, uint8_t* out)
+{
+    return _Sha3DmaOneshot(ctx, sha, &whSha3_256, in, inLen, out);
+}
+
+int wh_Client_Sha3_256DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                       const uint8_t* in, uint32_t inLen,
+                                       bool* requestSent)
+{
+    return _Sha3DmaUpdateRequest(ctx, sha, &whSha3_256, in, inLen, requestSent);
+}
+
+int wh_Client_Sha3_256DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3DmaUpdateResponse(ctx, sha, &whSha3_256);
+}
+
+int wh_Client_Sha3_256DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3DmaFinalRequest(ctx, sha, &whSha3_256);
+}
+
+int wh_Client_Sha3_256DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                       uint8_t* out)
+{
+    return _Sha3DmaFinalResponse(ctx, sha, &whSha3_256, out);
+}
+#endif /* !WOLFSSL_NOSHA3_256 */
+
+#ifndef WOLFSSL_NOSHA3_384
+int wh_Client_Sha3_384Dma(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                          uint32_t inLen, uint8_t* out)
+{
+    return _Sha3DmaOneshot(ctx, sha, &whSha3_384, in, inLen, out);
+}
+
+int wh_Client_Sha3_384DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                       const uint8_t* in, uint32_t inLen,
+                                       bool* requestSent)
+{
+    return _Sha3DmaUpdateRequest(ctx, sha, &whSha3_384, in, inLen, requestSent);
+}
+
+int wh_Client_Sha3_384DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3DmaUpdateResponse(ctx, sha, &whSha3_384);
+}
+
+int wh_Client_Sha3_384DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3DmaFinalRequest(ctx, sha, &whSha3_384);
+}
+
+int wh_Client_Sha3_384DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                       uint8_t* out)
+{
+    return _Sha3DmaFinalResponse(ctx, sha, &whSha3_384, out);
+}
+#endif /* !WOLFSSL_NOSHA3_384 */
+
+#ifndef WOLFSSL_NOSHA3_512
+int wh_Client_Sha3_512Dma(whClientContext* ctx, wc_Sha3* sha, const uint8_t* in,
+                          uint32_t inLen, uint8_t* out)
+{
+    return _Sha3DmaOneshot(ctx, sha, &whSha3_512, in, inLen, out);
+}
+
+int wh_Client_Sha3_512DmaUpdateRequest(whClientContext* ctx, wc_Sha3* sha,
+                                       const uint8_t* in, uint32_t inLen,
+                                       bool* requestSent)
+{
+    return _Sha3DmaUpdateRequest(ctx, sha, &whSha3_512, in, inLen, requestSent);
+}
+
+int wh_Client_Sha3_512DmaUpdateResponse(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3DmaUpdateResponse(ctx, sha, &whSha3_512);
+}
+
+int wh_Client_Sha3_512DmaFinalRequest(whClientContext* ctx, wc_Sha3* sha)
+{
+    return _Sha3DmaFinalRequest(ctx, sha, &whSha3_512);
+}
+
+int wh_Client_Sha3_512DmaFinalResponse(whClientContext* ctx, wc_Sha3* sha,
+                                       uint8_t* out)
+{
+    return _Sha3DmaFinalResponse(ctx, sha, &whSha3_512, out);
+}
+#endif /* !WOLFSSL_NOSHA3_512 */
+#endif /* WOLFHSM_CFG_DMA */
+
+#endif /* WOLFSSL_SHA3 */
+
 #ifdef WOLFSSL_HAVE_MLDSA
 
 int wh_Client_MlDsaSetKeyId(wc_MlDsaKey* key, whKeyId keyId)
@@ -10402,5 +11284,891 @@ int wh_Client_MlKemDecapsulateDma(whClientContext* ctx, MlKemKey* key,
 }
 #endif /* WOLFHSM_CFG_DMA */
 #endif /* WOLFSSL_HAVE_MLKEM */
+
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+#ifdef WOLFHSM_CFG_DMA
+
+#ifdef WOLFSSL_HAVE_LMS
+
+int wh_Client_LmsSetKeyId(LmsKey* key, whKeyId keyId)
+{
+    if (key == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+    key->devCtx = WH_KEYID_TO_DEVCTX(keyId);
+    return WH_ERROR_OK;
+}
+
+int wh_Client_LmsGetKeyId(LmsKey* key, whKeyId* outId)
+{
+    if (key == NULL || outId == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+    *outId = WH_DEVCTX_TO_KEYID(key->devCtx);
+    return WH_ERROR_OK;
+}
+
+int wh_Client_LmsMakeKeyDma(whClientContext* ctx, LmsKey* key,
+                            whKeyId* inout_key_id, whNvmFlags flags,
+                            uint16_t label_len, uint8_t* label)
+{
+    int                                              ret = WH_ERROR_OK;
+    int                                              postRet = WH_ERROR_OK;
+    whKeyId                                          key_id = WH_KEYID_ERASED;
+    uint8_t*                                         dataPtr;
+    whMessageCrypto_PqcStatefulSigKeyGenDmaRequest*  req;
+    whMessageCrypto_PqcStatefulSigKeyGenDmaResponse* res;
+    word32                                           pubLen32 = 0;
+    uintptr_t                                        pubAddr = 0;
+
+    if ((ctx == NULL) || (key == NULL) || (key->params == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Enforce write-through */
+    if ((flags & WH_NVM_FLAGS_EPHEMERAL) != 0) {
+        return WH_ERROR_BADARGS;
+    }
+
+    ret = wc_LmsKey_GetPubLen(key, &pubLen32);
+    if (ret != 0) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_PqcStatefulSigKeyGenDmaRequest*)
+        _createCryptoRequestWithSubtype(
+            dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_KEYGEN,
+            WC_PQC_STATEFUL_SIG_TYPE_LMS, ctx->cryptoAffinity);
+
+    if (inout_key_id != NULL) {
+        key_id = *inout_key_id;
+    }
+
+    {
+        uint16_t group  = WH_MESSAGE_GROUP_CRYPTO_DMA;
+        uint16_t action = WC_ALGO_TYPE_PK;
+        uint16_t req_len =
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req);
+
+        if (req_len > WOLFHSM_CFG_COMM_DATA_LEN) {
+            return WH_ERROR_BADARGS;
+        }
+
+        memset(req, 0, sizeof(*req));
+        req->flags         = flags;
+        req->keyId         = key_id;
+        req->access        = WH_NVM_ACCESS_ANY;
+        req->lmsLevels     = key->params->levels;
+        req->lmsHeight     = key->params->height;
+        req->lmsWinternitz = key->params->width;
+        req->pub.sz        = pubLen32;
+
+        ret = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)key->pub, (void**)&pubAddr, pubLen32,
+            WH_DMA_OPER_CLIENT_WRITE_PRE, (whDmaFlags){0});
+        if (ret == WH_ERROR_OK) {
+            req->pub.addr = (uint64_t)(uintptr_t)pubAddr;
+        }
+
+        if ((label != NULL) && (label_len > 0)) {
+            if (label_len > WH_NVM_LABEL_LEN) {
+                label_len = WH_NVM_LABEL_LEN;
+            }
+            memcpy(req->label, label, label_len);
+            req->labelSize = label_len;
+        }
+
+        if (ret == WH_ERROR_OK) {
+            ret = wh_Client_SendRequest(ctx, group, action, req_len,
+                                        (uint8_t*)dataPtr);
+        }
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = wh_Client_RecvResponse(ctx, &group, &action, &req_len,
+                                             (uint8_t*)dataPtr);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+
+        postRet = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)key->pub, (void**)&pubAddr, pubLen32,
+            WH_DMA_OPER_CLIENT_WRITE_POST, (whDmaFlags){0});
+
+        if (ret == WH_ERROR_OK) {
+            ret = _getCryptoResponse(dataPtr,
+                                     WC_PK_TYPE_PQC_STATEFUL_SIG_KEYGEN,
+                                     (uint8_t**)&res);
+            if (ret >= 0) {
+                key_id = (whKeyId)res->keyId;
+                if (inout_key_id != NULL) {
+                    *inout_key_id = key_id;
+                }
+                wh_Client_LmsSetKeyId(key, key_id);
+            }
+        }
+
+        /* Prioritize server errors over POST errors */
+        if (ret == WH_ERROR_OK) {
+            ret = postRet;
+        }
+    }
+
+    return ret;
+}
+
+int wh_Client_LmsMakeExportKeyDma(whClientContext* ctx, LmsKey* key)
+{
+    return wh_Client_LmsMakeKeyDma(ctx, key, NULL, WH_NVM_FLAGS_NONE, 0, NULL);
+}
+
+int wh_Client_LmsSignDma(whClientContext* ctx, const byte* msg, word32 msgSz,
+                         byte* sig, word32* sigSz, LmsKey* key)
+{
+    int                                            ret = WH_ERROR_OK;
+    int                                            postRet = WH_ERROR_OK;
+    uint8_t*                                       dataPtr;
+    whMessageCrypto_PqcStatefulSigSignDmaRequest*  req;
+    whMessageCrypto_PqcStatefulSigSignDmaResponse* res;
+    uintptr_t                                      msgAddr = 0;
+    uintptr_t                                      sigAddr = 0;
+    whKeyId                                        key_id;
+    word32                                         sigCap;
+
+    if ((ctx == NULL) || (key == NULL) || (msg == NULL) || (sig == NULL) ||
+        (sigSz == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    sigCap = *sigSz;
+    key_id = WH_DEVCTX_TO_KEYID(key->devCtx);
+    if (WH_KEYID_ISERASED(key_id)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_PqcStatefulSigSignDmaRequest*)
+        _createCryptoRequestWithSubtype(
+            dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_SIGN,
+            WC_PQC_STATEFUL_SIG_TYPE_LMS, ctx->cryptoAffinity);
+
+    {
+        uint16_t group  = WH_MESSAGE_GROUP_CRYPTO_DMA;
+        uint16_t action = WC_ALGO_TYPE_PK;
+        uint16_t req_len =
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req);
+
+        if (req_len > WOLFHSM_CFG_COMM_DATA_LEN) {
+            return WH_ERROR_BADARGS;
+        }
+
+        memset(req, 0, sizeof(*req));
+        req->keyId   = key_id;
+        req->options = 0;
+        req->msg.sz  = msgSz;
+        req->sig.sz  = sigCap;
+
+        ret = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)msg, (void**)&msgAddr, msgSz,
+            WH_DMA_OPER_CLIENT_READ_PRE, (whDmaFlags){0});
+        if (ret == WH_ERROR_OK) {
+            req->msg.addr = (uint64_t)(uintptr_t)msgAddr;
+            ret = wh_Client_DmaProcessClientAddress(
+                ctx, (uintptr_t)sig, (void**)&sigAddr, sigCap,
+                WH_DMA_OPER_CLIENT_WRITE_PRE, (whDmaFlags){0});
+        }
+        if (ret == WH_ERROR_OK) {
+            req->sig.addr = (uint64_t)(uintptr_t)sigAddr;
+            ret = wh_Client_SendRequest(ctx, group, action, req_len,
+                                        (uint8_t*)dataPtr);
+        }
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = wh_Client_RecvResponse(ctx, &group, &action, &req_len,
+                                             (uint8_t*)dataPtr);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+
+        (void)wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)msg, (void**)&msgAddr, msgSz,
+            WH_DMA_OPER_CLIENT_READ_POST, (whDmaFlags){0});
+        postRet = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)sig, (void**)&sigAddr, sigCap,
+            WH_DMA_OPER_CLIENT_WRITE_POST, (whDmaFlags){0});
+
+        if (ret == WH_ERROR_OK) {
+            ret = _getCryptoResponse(dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_SIGN,
+                                     (uint8_t**)&res);
+            if (ret >= 0) {
+                if (res->sigLen > sigCap) {
+                    ret = WH_ERROR_BADARGS;
+                }
+                else {
+                    *sigSz = res->sigLen;
+                    ret = WH_ERROR_OK;
+                }
+            }
+        }
+
+        /* Prioritize server errors over POST errors */
+        if (ret == WH_ERROR_OK) {
+            ret = postRet;
+        }
+    }
+
+    return ret;
+}
+
+int wh_Client_LmsVerifyDma(whClientContext* ctx, const byte* sig, word32 sigSz,
+                           const byte* msg, word32 msgSz, int* res, LmsKey* key)
+{
+    int                                              ret = WH_ERROR_OK;
+    uint8_t*                                         dataPtr;
+    whMessageCrypto_PqcStatefulSigVerifyDmaRequest*  req;
+    whMessageCrypto_PqcStatefulSigVerifyDmaResponse* resp;
+    uintptr_t                                        sigAddr = 0;
+    uintptr_t                                        msgAddr = 0;
+    whKeyId                                          key_id;
+
+    if ((ctx == NULL) || (key == NULL) || (sig == NULL) || (msg == NULL) ||
+        (res == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    key_id = WH_DEVCTX_TO_KEYID(key->devCtx);
+    if (WH_KEYID_ISERASED(key_id)) {
+        /* No HSM-resident key; let wolfCrypt fall through to software verify
+         * using the client-side public key. */
+        return WH_ERROR_NOTIMPL;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_PqcStatefulSigVerifyDmaRequest*)
+        _createCryptoRequestWithSubtype(
+            dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_VERIFY,
+            WC_PQC_STATEFUL_SIG_TYPE_LMS, ctx->cryptoAffinity);
+
+    {
+        uint16_t group  = WH_MESSAGE_GROUP_CRYPTO_DMA;
+        uint16_t action = WC_ALGO_TYPE_PK;
+        uint16_t req_len =
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req);
+
+        if (req_len > WOLFHSM_CFG_COMM_DATA_LEN) {
+            return WH_ERROR_BADARGS;
+        }
+
+        memset(req, 0, sizeof(*req));
+        req->keyId  = key_id;
+        req->sig.sz = sigSz;
+        req->msg.sz = msgSz;
+
+        ret = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)sig, (void**)&sigAddr, sigSz,
+            WH_DMA_OPER_CLIENT_READ_PRE, (whDmaFlags){0});
+        if (ret == WH_ERROR_OK) {
+            req->sig.addr = (uint64_t)(uintptr_t)sigAddr;
+            ret = wh_Client_DmaProcessClientAddress(
+                ctx, (uintptr_t)msg, (void**)&msgAddr, msgSz,
+                WH_DMA_OPER_CLIENT_READ_PRE, (whDmaFlags){0});
+        }
+        if (ret == WH_ERROR_OK) {
+            req->msg.addr = (uint64_t)(uintptr_t)msgAddr;
+            ret = wh_Client_SendRequest(ctx, group, action, req_len,
+                                        (uint8_t*)dataPtr);
+        }
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = wh_Client_RecvResponse(ctx, &group, &action, &req_len,
+                                             (uint8_t*)dataPtr);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+
+        (void)wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)sig, (void**)&sigAddr, sigSz,
+            WH_DMA_OPER_CLIENT_READ_POST, (whDmaFlags){0});
+        (void)wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)msg, (void**)&msgAddr, msgSz,
+            WH_DMA_OPER_CLIENT_READ_POST, (whDmaFlags){0});
+
+        if (ret == WH_ERROR_OK) {
+            ret = _getCryptoResponse(dataPtr,
+                                     WC_PK_TYPE_PQC_STATEFUL_SIG_VERIFY,
+                                     (uint8_t**)&resp);
+            if (ret >= 0) {
+                *res = (int)resp->res;
+                ret = WH_ERROR_OK;
+            }
+        }
+    }
+
+    return ret;
+}
+
+int wh_Client_LmsSigsLeftDma(whClientContext* ctx, LmsKey* key)
+{
+    int                                                ret = WH_ERROR_OK;
+    uint8_t*                                           dataPtr;
+    whMessageCrypto_PqcStatefulSigSigsLeftDmaRequest*  req;
+    whMessageCrypto_PqcStatefulSigSigsLeftDmaResponse* res;
+    whKeyId                                            key_id;
+
+    if ((ctx == NULL) || (key == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    key_id = WH_DEVCTX_TO_KEYID(key->devCtx);
+    if (WH_KEYID_ISERASED(key_id)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_PqcStatefulSigSigsLeftDmaRequest*)
+        _createCryptoRequestWithSubtype(
+            dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_SIGS_LEFT,
+            WC_PQC_STATEFUL_SIG_TYPE_LMS, ctx->cryptoAffinity);
+
+    {
+        uint16_t group  = WH_MESSAGE_GROUP_CRYPTO_DMA;
+        uint16_t action = WC_ALGO_TYPE_PK;
+        uint16_t req_len =
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req);
+
+        if (req_len > WOLFHSM_CFG_COMM_DATA_LEN) {
+            return WH_ERROR_BADARGS;
+        }
+
+        memset(req, 0, sizeof(*req));
+        req->keyId = key_id;
+
+        ret = wh_Client_SendRequest(ctx, group, action, req_len,
+                                    (uint8_t*)dataPtr);
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = wh_Client_RecvResponse(ctx, &group, &action, &req_len,
+                                             (uint8_t*)dataPtr);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+        if (ret == WH_ERROR_OK) {
+            ret = _getCryptoResponse(dataPtr,
+                                     WC_PK_TYPE_PQC_STATEFUL_SIG_SIGS_LEFT,
+                                     (uint8_t**)&res);
+            if (ret >= 0) {
+                /* The server mirrors wc_LmsKey_SigsLeft(), which is a
+                 * boolean. Normalize so the only nonzero return is 1. */
+                ret = (res->sigsLeft != 0) ? 1 : 0;
+            }
+        }
+    }
+
+    return ret;
+}
+
+int wh_Client_LmsImportPubKey(whClientContext* ctx, LmsKey* key,
+                              whKeyId* inout_keyId, whNvmFlags flags,
+                              uint16_t label_len, uint8_t* label)
+{
+    int      ret;
+    uint8_t  blob[256];
+    uint16_t blobSz = (uint16_t)sizeof(blob);
+    uint16_t keyId16;
+
+    if ((ctx == NULL) || (key == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Build a public-only slot blob from the loaded public key, then provision
+     * it via the generic keystore. The server stores no private state, so the
+     * key is verify-only. */
+    ret = wh_Crypto_LmsSerializePubKey(key, blobSz, blob, &blobSz);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+
+    keyId16 = (uint16_t)((inout_keyId != NULL) ? *inout_keyId
+                                               : WH_KEYID_ERASED);
+    ret = wh_Client_KeyCache(ctx, (uint32_t)flags, label, label_len, blob,
+                             blobSz, &keyId16);
+    if ((ret == WH_ERROR_OK) && ((flags & WH_NVM_FLAGS_EPHEMERAL) == 0)) {
+        ret = wh_Client_KeyCommit(ctx, (whNvmId)keyId16);
+    }
+    if (ret == WH_ERROR_OK) {
+        wh_Client_LmsSetKeyId(key, (whKeyId)keyId16);
+        if (inout_keyId != NULL) {
+            *inout_keyId = (whKeyId)keyId16;
+        }
+    }
+    return ret;
+}
+
+#endif /* WOLFSSL_HAVE_LMS */
+
+#ifdef WOLFSSL_HAVE_XMSS
+
+int wh_Client_XmssSetKeyId(XmssKey* key, whKeyId keyId)
+{
+    if (key == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+    key->devCtx = WH_KEYID_TO_DEVCTX(keyId);
+    return WH_ERROR_OK;
+}
+
+int wh_Client_XmssGetKeyId(XmssKey* key, whKeyId* outId)
+{
+    if (key == NULL || outId == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+    *outId = WH_DEVCTX_TO_KEYID(key->devCtx);
+    return WH_ERROR_OK;
+}
+
+/* The XMSS implementations mirror the LMS ones; the only differences are the
+ * subType passed to _createCryptoRequestWithSubtype and the key field names
+ * (key->pk instead of key->pub, key->params is XmssParams). */
+int wh_Client_XmssMakeKeyDma(whClientContext* ctx, XmssKey* key,
+                             whKeyId* inout_key_id, whNvmFlags flags,
+                             uint16_t label_len, uint8_t* label)
+{
+    int                                              ret = WH_ERROR_OK;
+    int                                              postRet = WH_ERROR_OK;
+    whKeyId                                          key_id = WH_KEYID_ERASED;
+    uint8_t*                                         dataPtr;
+    whMessageCrypto_PqcStatefulSigKeyGenDmaRequest*  req;
+    whMessageCrypto_PqcStatefulSigKeyGenDmaResponse* res;
+    word32                                           pubLen32 = 0;
+    uintptr_t                                        pubAddr = 0;
+
+    if ((ctx == NULL) || (key == NULL) || (key->params == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Enforce write-through */
+    if ((flags & WH_NVM_FLAGS_EPHEMERAL) != 0) {
+        return WH_ERROR_BADARGS;
+    }
+
+    ret = wc_XmssKey_GetPubLen(key, &pubLen32);
+    if (ret != 0) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_PqcStatefulSigKeyGenDmaRequest*)
+        _createCryptoRequestWithSubtype(
+            dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_KEYGEN,
+            WC_PQC_STATEFUL_SIG_TYPE_XMSS, ctx->cryptoAffinity);
+
+    if (inout_key_id != NULL) {
+        key_id = *inout_key_id;
+    }
+
+    {
+        uint16_t group  = WH_MESSAGE_GROUP_CRYPTO_DMA;
+        uint16_t action = WC_ALGO_TYPE_PK;
+        uint16_t req_len =
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req);
+
+        if (req_len > WOLFHSM_CFG_COMM_DATA_LEN) {
+            return WH_ERROR_BADARGS;
+        }
+
+        memset(req, 0, sizeof(*req));
+        req->flags  = flags;
+        req->keyId  = key_id;
+        req->access = WH_NVM_ACCESS_ANY;
+        req->pub.sz = pubLen32;
+
+        {
+            const char* paramStr = NULL;
+            ret = wc_XmssKey_GetParamStr(key, &paramStr);
+            if (ret != 0) {
+                return WH_ERROR_BADARGS;
+            }
+            if (XSTRLEN(paramStr) >= sizeof(req->xmssParamStr)) {
+                return WH_ERROR_BADARGS;
+            }
+            XSTRNCPY(req->xmssParamStr, paramStr, sizeof(req->xmssParamStr));
+            req->xmssParamStr[sizeof(req->xmssParamStr) - 1] = '\0';
+        }
+
+        ret = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)key->pk, (void**)&pubAddr, pubLen32,
+            WH_DMA_OPER_CLIENT_WRITE_PRE, (whDmaFlags){0});
+        if (ret == WH_ERROR_OK) {
+            req->pub.addr = (uint64_t)(uintptr_t)pubAddr;
+        }
+
+        if ((label != NULL) && (label_len > 0)) {
+            if (label_len > WH_NVM_LABEL_LEN) {
+                label_len = WH_NVM_LABEL_LEN;
+            }
+            memcpy(req->label, label, label_len);
+            req->labelSize = label_len;
+        }
+
+        if (ret == WH_ERROR_OK) {
+            ret = wh_Client_SendRequest(ctx, group, action, req_len,
+                                        (uint8_t*)dataPtr);
+        }
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = wh_Client_RecvResponse(ctx, &group, &action, &req_len,
+                                             (uint8_t*)dataPtr);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+
+        postRet = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)key->pk, (void**)&pubAddr, pubLen32,
+            WH_DMA_OPER_CLIENT_WRITE_POST, (whDmaFlags){0});
+
+        if (ret == WH_ERROR_OK) {
+            ret = _getCryptoResponse(dataPtr,
+                                     WC_PK_TYPE_PQC_STATEFUL_SIG_KEYGEN,
+                                     (uint8_t**)&res);
+            if (ret >= 0) {
+                key_id = (whKeyId)res->keyId;
+                if (inout_key_id != NULL) {
+                    *inout_key_id = key_id;
+                }
+                wh_Client_XmssSetKeyId(key, key_id);
+            }
+        }
+
+        /* Prioritize server errors over POST errors */
+        if (ret == WH_ERROR_OK) {
+            ret = postRet;
+        }
+    }
+
+    return ret;
+}
+
+int wh_Client_XmssMakeExportKeyDma(whClientContext* ctx, XmssKey* key)
+{
+    return wh_Client_XmssMakeKeyDma(ctx, key, NULL, WH_NVM_FLAGS_NONE, 0, NULL);
+}
+
+int wh_Client_XmssSignDma(whClientContext* ctx, const byte* msg, word32 msgSz,
+                          byte* sig, word32* sigSz, XmssKey* key)
+{
+    int                                            ret = WH_ERROR_OK;
+    int                                            postRet = WH_ERROR_OK;
+    uint8_t*                                       dataPtr;
+    whMessageCrypto_PqcStatefulSigSignDmaRequest*  req;
+    whMessageCrypto_PqcStatefulSigSignDmaResponse* res;
+    uintptr_t                                      msgAddr = 0;
+    uintptr_t                                      sigAddr = 0;
+    whKeyId                                        key_id;
+    word32                                         sigCap;
+
+    if ((ctx == NULL) || (key == NULL) || (msg == NULL) || (sig == NULL) ||
+        (sigSz == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    sigCap = *sigSz;
+    key_id = WH_DEVCTX_TO_KEYID(key->devCtx);
+    if (WH_KEYID_ISERASED(key_id)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_PqcStatefulSigSignDmaRequest*)
+        _createCryptoRequestWithSubtype(
+            dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_SIGN,
+            WC_PQC_STATEFUL_SIG_TYPE_XMSS, ctx->cryptoAffinity);
+
+    {
+        uint16_t group  = WH_MESSAGE_GROUP_CRYPTO_DMA;
+        uint16_t action = WC_ALGO_TYPE_PK;
+        uint16_t req_len =
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req);
+
+        if (req_len > WOLFHSM_CFG_COMM_DATA_LEN) {
+            return WH_ERROR_BADARGS;
+        }
+
+        memset(req, 0, sizeof(*req));
+        req->keyId   = key_id;
+        req->options = 0;
+        req->msg.sz  = msgSz;
+        req->sig.sz  = sigCap;
+
+        ret = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)msg, (void**)&msgAddr, msgSz,
+            WH_DMA_OPER_CLIENT_READ_PRE, (whDmaFlags){0});
+        if (ret == WH_ERROR_OK) {
+            req->msg.addr = (uint64_t)(uintptr_t)msgAddr;
+            ret = wh_Client_DmaProcessClientAddress(
+                ctx, (uintptr_t)sig, (void**)&sigAddr, sigCap,
+                WH_DMA_OPER_CLIENT_WRITE_PRE, (whDmaFlags){0});
+        }
+        if (ret == WH_ERROR_OK) {
+            req->sig.addr = (uint64_t)(uintptr_t)sigAddr;
+            ret = wh_Client_SendRequest(ctx, group, action, req_len,
+                                        (uint8_t*)dataPtr);
+        }
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = wh_Client_RecvResponse(ctx, &group, &action, &req_len,
+                                             (uint8_t*)dataPtr);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+
+        (void)wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)msg, (void**)&msgAddr, msgSz,
+            WH_DMA_OPER_CLIENT_READ_POST, (whDmaFlags){0});
+        postRet = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)sig, (void**)&sigAddr, sigCap,
+            WH_DMA_OPER_CLIENT_WRITE_POST, (whDmaFlags){0});
+
+        if (ret == WH_ERROR_OK) {
+            ret = _getCryptoResponse(dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_SIGN,
+                                     (uint8_t**)&res);
+            if (ret >= 0) {
+                if (res->sigLen > sigCap) {
+                    ret = WH_ERROR_BADARGS;
+                }
+                else {
+                    *sigSz = res->sigLen;
+                    ret = WH_ERROR_OK;
+                }
+            }
+        }
+
+        /* Prioritize server errors over POST errors */
+        if (ret == WH_ERROR_OK) {
+            ret = postRet;
+        }
+    }
+
+    return ret;
+}
+
+int wh_Client_XmssVerifyDma(whClientContext* ctx, const byte* sig,
+                            word32 sigSz, const byte* msg, word32 msgSz,
+                            int* res, XmssKey* key)
+{
+    int                                              ret = WH_ERROR_OK;
+    uint8_t*                                         dataPtr;
+    whMessageCrypto_PqcStatefulSigVerifyDmaRequest*  req;
+    whMessageCrypto_PqcStatefulSigVerifyDmaResponse* resp;
+    uintptr_t                                        sigAddr = 0;
+    uintptr_t                                        msgAddr = 0;
+    whKeyId                                          key_id;
+
+    if ((ctx == NULL) || (key == NULL) || (sig == NULL) || (msg == NULL) ||
+        (res == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    key_id = WH_DEVCTX_TO_KEYID(key->devCtx);
+    if (WH_KEYID_ISERASED(key_id)) {
+        /* No HSM-resident key; let wolfCrypt fall through to software verify
+         * using the client-side public key. */
+        return WH_ERROR_NOTIMPL;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_PqcStatefulSigVerifyDmaRequest*)
+        _createCryptoRequestWithSubtype(
+            dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_VERIFY,
+            WC_PQC_STATEFUL_SIG_TYPE_XMSS, ctx->cryptoAffinity);
+
+    {
+        uint16_t group  = WH_MESSAGE_GROUP_CRYPTO_DMA;
+        uint16_t action = WC_ALGO_TYPE_PK;
+        uint16_t req_len =
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req);
+
+        if (req_len > WOLFHSM_CFG_COMM_DATA_LEN) {
+            return WH_ERROR_BADARGS;
+        }
+
+        memset(req, 0, sizeof(*req));
+        req->keyId  = key_id;
+        req->sig.sz = sigSz;
+        req->msg.sz = msgSz;
+
+        ret = wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)sig, (void**)&sigAddr, sigSz,
+            WH_DMA_OPER_CLIENT_READ_PRE, (whDmaFlags){0});
+        if (ret == WH_ERROR_OK) {
+            req->sig.addr = (uint64_t)(uintptr_t)sigAddr;
+            ret = wh_Client_DmaProcessClientAddress(
+                ctx, (uintptr_t)msg, (void**)&msgAddr, msgSz,
+                WH_DMA_OPER_CLIENT_READ_PRE, (whDmaFlags){0});
+        }
+        if (ret == WH_ERROR_OK) {
+            req->msg.addr = (uint64_t)(uintptr_t)msgAddr;
+            ret = wh_Client_SendRequest(ctx, group, action, req_len,
+                                        (uint8_t*)dataPtr);
+        }
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = wh_Client_RecvResponse(ctx, &group, &action, &req_len,
+                                             (uint8_t*)dataPtr);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+
+        (void)wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)sig, (void**)&sigAddr, sigSz,
+            WH_DMA_OPER_CLIENT_READ_POST, (whDmaFlags){0});
+        (void)wh_Client_DmaProcessClientAddress(
+            ctx, (uintptr_t)msg, (void**)&msgAddr, msgSz,
+            WH_DMA_OPER_CLIENT_READ_POST, (whDmaFlags){0});
+
+        if (ret == WH_ERROR_OK) {
+            ret = _getCryptoResponse(dataPtr,
+                                     WC_PK_TYPE_PQC_STATEFUL_SIG_VERIFY,
+                                     (uint8_t**)&resp);
+            if (ret >= 0) {
+                *res = (int)resp->res;
+                ret = WH_ERROR_OK;
+            }
+        }
+    }
+
+    return ret;
+}
+
+int wh_Client_XmssSigsLeftDma(whClientContext* ctx, XmssKey* key)
+{
+    int                                                ret = WH_ERROR_OK;
+    uint8_t*                                           dataPtr;
+    whMessageCrypto_PqcStatefulSigSigsLeftDmaRequest*  req;
+    whMessageCrypto_PqcStatefulSigSigsLeftDmaResponse* res;
+    whKeyId                                            key_id;
+
+    if ((ctx == NULL) || (key == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    key_id = WH_DEVCTX_TO_KEYID(key->devCtx);
+    if (WH_KEYID_ISERASED(key_id)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    dataPtr = (uint8_t*)wh_CommClient_GetDataPtr(ctx->comm);
+    if (dataPtr == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    req = (whMessageCrypto_PqcStatefulSigSigsLeftDmaRequest*)
+        _createCryptoRequestWithSubtype(
+            dataPtr, WC_PK_TYPE_PQC_STATEFUL_SIG_SIGS_LEFT,
+            WC_PQC_STATEFUL_SIG_TYPE_XMSS, ctx->cryptoAffinity);
+
+    {
+        uint16_t group  = WH_MESSAGE_GROUP_CRYPTO_DMA;
+        uint16_t action = WC_ALGO_TYPE_PK;
+        uint16_t req_len =
+            sizeof(whMessageCrypto_GenericRequestHeader) + sizeof(*req);
+
+        if (req_len > WOLFHSM_CFG_COMM_DATA_LEN) {
+            return WH_ERROR_BADARGS;
+        }
+
+        memset(req, 0, sizeof(*req));
+        req->keyId = key_id;
+
+        ret = wh_Client_SendRequest(ctx, group, action, req_len,
+                                    (uint8_t*)dataPtr);
+        if (ret == WH_ERROR_OK) {
+            do {
+                ret = wh_Client_RecvResponse(ctx, &group, &action, &req_len,
+                                             (uint8_t*)dataPtr);
+            } while (ret == WH_ERROR_NOTREADY);
+        }
+        if (ret == WH_ERROR_OK) {
+            ret = _getCryptoResponse(dataPtr,
+                                     WC_PK_TYPE_PQC_STATEFUL_SIG_SIGS_LEFT,
+                                     (uint8_t**)&res);
+            if (ret >= 0) {
+                /* The server mirrors wc_XmssKey_SigsLeft(), which is a
+                 * boolean. Normalize so the only nonzero return is 1. */
+                ret = (res->sigsLeft != 0) ? 1 : 0;
+            }
+        }
+    }
+
+    return ret;
+}
+
+int wh_Client_XmssImportPubKey(whClientContext* ctx, XmssKey* key,
+                               whKeyId* inout_keyId, whNvmFlags flags,
+                               uint16_t label_len, uint8_t* label)
+{
+    int         ret;
+    uint8_t     blob[256];
+    uint16_t    blobSz = (uint16_t)sizeof(blob);
+    uint16_t    keyId16;
+    const char* paramStr = NULL;
+
+    if ((ctx == NULL) || (key == NULL)) {
+        return WH_ERROR_BADARGS;
+    }
+
+    ret = wc_XmssKey_GetParamStr(key, &paramStr);
+    if (ret != 0) {
+        return WH_ERROR_BADARGS;
+    }
+
+    /* Build a public-only slot blob, then provision it via the generic
+     * keystore. The server stores no secret state, so the key is verify-only.
+     */
+    ret = wh_Crypto_XmssSerializePubKey(key, paramStr, blobSz, blob, &blobSz);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+
+    keyId16 = (uint16_t)((inout_keyId != NULL) ? *inout_keyId
+                                               : WH_KEYID_ERASED);
+    ret = wh_Client_KeyCache(ctx, (uint32_t)flags, label, label_len, blob,
+                             blobSz, &keyId16);
+    if ((ret == WH_ERROR_OK) && ((flags & WH_NVM_FLAGS_EPHEMERAL) == 0)) {
+        ret = wh_Client_KeyCommit(ctx, (whNvmId)keyId16);
+    }
+    if (ret == WH_ERROR_OK) {
+        wh_Client_XmssSetKeyId(key, (whKeyId)keyId16);
+        if (inout_keyId != NULL) {
+            *inout_keyId = (whKeyId)keyId16;
+        }
+    }
+    return ret;
+}
+
+#endif /* WOLFSSL_HAVE_XMSS */
+
+#endif /* WOLFHSM_CFG_DMA */
+#endif /* WOLFSSL_HAVE_LMS || WOLFSSL_HAVE_XMSS */
 
 #endif /* !WOLFHSM_CFG_NO_CRYPTO && WOLFHSM_CFG_ENABLE_CLIENT */
