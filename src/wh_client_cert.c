@@ -414,6 +414,7 @@ static int _certVerifyResponse(whClientContext* c, whKeyId* out_keyId,
     uint16_t                     size;
     whMessageCert_VerifyResponse resp;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -447,6 +448,7 @@ static int _certVerify(whClientContext* c, const uint8_t* cert,
     int     rc    = 0;
     whKeyId keyId = WH_KEYID_ERASED;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (cert == NULL) || (cert_len == 0) ||
         (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
@@ -569,6 +571,7 @@ static int _certVerifyMultiRootResponse(whClientContext* c, whKeyId* out_keyId,
     uint16_t                     size;
     whMessageCert_VerifyResponse resp;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -604,6 +607,7 @@ static int _certVerifyMultiRoot(whClientContext* c, const uint8_t* cert,
     int     rc    = 0;
     whKeyId keyId = WH_KEYID_ERASED;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (cert == NULL) || (cert_len == 0) ||
         (trustedRootNvmIds == NULL) || (numRoots == 0) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
@@ -1061,6 +1065,7 @@ static int _certVerifyDmaResponse(whClientContext* c, whKeyId* out_keyId,
     uint16_t                        size;
     whMessageCert_VerifyDmaResponse resp;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -1101,6 +1106,7 @@ static int _certVerifyDma(whClientContext* c, const void* cert,
     int     rc    = 0;
     whKeyId keyId = WH_KEYID_ERASED;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -1231,6 +1237,7 @@ static int _certVerifyMultiRootDmaResponse(whClientContext* c,
     uint16_t                        size;
     whMessageCert_VerifyDmaResponse resp;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -1273,6 +1280,7 @@ static int _certVerifyMultiRootDma(whClientContext* c, const void* cert,
     int     rc    = 0;
     whKeyId keyId = WH_KEYID_ERASED;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -1388,6 +1396,7 @@ int wh_Client_CertVerifyAcertResponse(whClientContext* c, int32_t* out_rc)
     uint16_t                     size;
     whMessageCert_SimpleResponse resp;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -1415,6 +1424,7 @@ int wh_Client_CertVerifyAcert(whClientContext* c, const void* cert,
 {
     int rc = 0;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -1478,6 +1488,7 @@ int wh_Client_CertVerifyAcertDmaResponse(whClientContext* c, int32_t* out_rc)
     uint16_t                     size;
     whMessageCert_SimpleResponse resp;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
@@ -1512,6 +1523,7 @@ int wh_Client_CertVerifyAcertDma(whClientContext* c, const void* cert,
 {
     int rc = 0;
 
+    /* out_rc is mandatory; it carries the verification verdict */
     if ((c == NULL) || (out_rc == NULL)) {
         return WH_ERROR_BADARGS;
     }
